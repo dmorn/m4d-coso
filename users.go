@@ -81,12 +81,15 @@ func (r *UserRegistry) Register(ctx context.Context, telegramID int64, isAdmin b
 		return fmt.Errorf("generate password: %w", err)
 	}
 
-	// Create Postgres LOGIN role
+	// Create Postgres LOGIN role (ignore if already exists)
 	_, err = r.adminPool.Exec(ctx,
-		fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD '%s'`, pgUser, pgPassword))
+		fmt.Sprintf(`DO $$ BEGIN
+			CREATE ROLE %s LOGIN PASSWORD '%s';
+		EXCEPTION WHEN duplicate_object THEN
+			ALTER ROLE %s LOGIN PASSWORD '%s';
+		END $$`, pgUser, pgPassword, pgUser, pgPassword))
 	if err != nil {
-		// Role might already exist
-		log.Printf("register user %d: create role: %v (continuing)", telegramID, err)
+		return fmt.Errorf("create role %s: %w", pgUser, err)
 	}
 
 	// Grant base permissions
@@ -94,7 +97,7 @@ func (r *UserRegistry) Register(ctx context.Context, telegramID int64, isAdmin b
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE m4dtimes TO %s`, pgUser),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, pgUser),
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON rooms TO %s`, pgUser),
-		fmt.Sprintf(`GRANT USAGE, SELECT ON SEQUENCE rooms_id_seq TO %s`, pgUser),
+		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, pgUser),
 		fmt.Sprintf(`GRANT SELECT ON users TO %s`, pgUser),
 	}
 	if isAdmin {
