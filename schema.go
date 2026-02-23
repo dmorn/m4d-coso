@@ -42,15 +42,8 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
-			return fmt.Errorf("schema: %w\nstmt: %s", err, s[:min(60, len(s))])
+			return fmt.Errorf("schema: %w\nstmt: %.60s", err, s)
 		}
 	}
 	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

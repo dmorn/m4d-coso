@@ -72,9 +72,7 @@ func main() {
 
 	// Tool registry
 	toolRegistry := agent.NewToolRegistry()
-	// Tools are registered per-message via BuildTools (user pool injected via BuildExtra)
-	// We register with a nil pool here; the actual pool comes from ToolContext.Extra.
-	toolRegistry.RegisterToolSet(newHotelTools(nil))
+	toolRegistry.RegisterToolSet(newHotelTools())
 
 	// Agent
 	a := agent.New(agent.Options{

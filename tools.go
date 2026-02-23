@@ -4,35 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dmorn/m4dtimes/sdk/agent"
 	"github.com/dmorn/m4dtimes/sdk/llm"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Ensure pgxpool is used (via poolFrom)
+type HotelTools struct{}
 
-// HotelTools groups all hotel management tools.
-// db may be nil at registration time — the actual pool is taken from ToolContext.Extra
-// (injected by BuildExtra in main.go as a *pgxpool.Pool per user).
-type HotelTools struct {
-	db *pgxpool.Pool
-}
-
-func newHotelTools(db *pgxpool.Pool) *HotelTools {
-	return &HotelTools{db: db}
-}
+func newHotelTools() *HotelTools { return &HotelTools{} }
 
 func (h *HotelTools) Tools() []agent.Tool {
-	return []agent.Tool{
-		&listRoomsTool{},
-		&setOccupiedTool{},
-		&addRoomTool{},
-		&addNoteTool{},
-	}
+	return []agent.Tool{&executeSQLTool{}}
 }
 
-// poolFrom extracts the per-user *pgxpool.Pool from ToolContext.Extra.
 func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
 	pool, ok := ctx.Extra.(*pgxpool.Pool)
 	if !ok || pool == nil {
@@ -41,176 +27,84 @@ func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// ── list_rooms ──────────────────────────────────────────────────────────────
+// ── execute_sql ──────────────────────────────────────────────────────────────
 
-type listRoomsTool struct{}
+type executeSQLTool struct{}
 
-func (t *listRoomsTool) Def() llm.ToolDef {
+func (t *executeSQLTool) Def() llm.ToolDef {
 	return llm.ToolDef{
-		Name:        "list_rooms",
-		Description: "List all hotel rooms with their current status (occupied/free) and notes.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
-	}
-}
-
-func (t *listRoomsTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (string, error) {
-	db, err := poolFrom(ctx)
-	if err != nil {
-		return "", err
-	}
-	rows, err := db.Query(context.Background(),
-		`SELECT id, name, floor, occupied, COALESCE(notes,'') FROM rooms ORDER BY floor, name`)
-	if err != nil {
-		return "", fmt.Errorf("query rooms: %w", err)
-	}
-	defer rows.Close()
-
-	var result string
-	for rows.Next() {
-		var id int
-		var name, notes string
-		var floor int
-		var occupied bool
-		if err := rows.Scan(&id, &name, &floor, &occupied, &notes); err != nil {
-			return "", err
-		}
-		status := "free"
-		if occupied {
-			status = "OCCUPIED"
-		}
-		line := fmt.Sprintf("- Room %s (floor %d): %s", name, floor, status)
-		if notes != "" {
-			line += " — " + notes
-		}
-		result += line + "\n"
-	}
-	if result == "" {
-		return "No rooms found.", nil
-	}
-	return result, nil
-}
-
-// ── set_occupied ─────────────────────────────────────────────────────────────
-
-type setOccupiedTool struct{}
-
-func (t *setOccupiedTool) Def() llm.ToolDef {
-	return llm.ToolDef{
-		Name:        "set_occupied",
-		Description: "Mark a room as occupied or free.",
+		Name:        "execute_sql",
+		Description: "Execute an arbitrary SQL query against the database. Returns rows as text for SELECT, or affected row count for INSERT/UPDATE/DELETE.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"room_name": {"type": "string", "description": "Room name, e.g. '101'"},
-				"occupied":  {"type": "boolean", "description": "true = occupied, false = free"}
+				"query": {"type": "string", "description": "The SQL query to execute"}
 			},
-			"required": ["room_name", "occupied"]
+			"required": ["query"]
 		}`),
 	}
 }
 
-func (t *setOccupiedTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+func (t *executeSQLTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
 	db, err := poolFrom(ctx)
 	if err != nil {
 		return "", err
 	}
+
 	var in struct {
-		RoomName string `json:"room_name"`
-		Occupied bool   `json:"occupied"`
+		Query string `json:"query"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
 	}
-	tag, err := db.Exec(context.Background(),
-		`UPDATE rooms SET occupied=$1 WHERE name=$2`, in.Occupied, in.RoomName)
+
+	q := strings.TrimSpace(in.Query)
+	if q == "" {
+		return "", fmt.Errorf("empty query")
+	}
+
+	// SELECT → return rows
+	upper := strings.ToUpper(q)
+	if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "WITH") {
+		rows, err := db.Query(context.Background(), q)
+		if err != nil {
+			return "", fmt.Errorf("query: %w", err)
+		}
+		defer rows.Close()
+
+		fields := rows.FieldDescriptions()
+		headers := make([]string, len(fields))
+		for i, f := range fields {
+			headers[i] = string(f.Name)
+		}
+
+		var sb strings.Builder
+		sb.WriteString(strings.Join(headers, " | "))
+		sb.WriteString("\n" + strings.Repeat("-", 40) + "\n")
+
+		count := 0
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return "", err
+			}
+			parts := make([]string, len(vals))
+			for i, v := range vals {
+				parts[i] = fmt.Sprintf("%v", v)
+			}
+			sb.WriteString(strings.Join(parts, " | ") + "\n")
+			count++
+		}
+		if count == 0 {
+			sb.WriteString("(no rows)\n")
+		}
+		return sb.String(), nil
+	}
+
+	// INSERT / UPDATE / DELETE / DDL → exec
+	tag, err := db.Exec(context.Background(), q)
 	if err != nil {
-		return "", fmt.Errorf("update room: %w", err)
+		return "", fmt.Errorf("exec: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Sprintf("Room '%s' not found.", in.RoomName), nil
-	}
-	status := "free"
-	if in.Occupied {
-		status = "occupied"
-	}
-	return fmt.Sprintf("Room %s marked as %s.", in.RoomName, status), nil
-}
-
-// ── add_room ─────────────────────────────────────────────────────────────────
-
-type addRoomTool struct{}
-
-func (t *addRoomTool) Def() llm.ToolDef {
-	return llm.ToolDef{
-		Name:        "add_room",
-		Description: "Add a new room to the hotel.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"name":  {"type": "string", "description": "Room name, e.g. '101'"},
-				"floor": {"type": "integer", "description": "Floor number"}
-			},
-			"required": ["name", "floor"]
-		}`),
-	}
-}
-
-func (t *addRoomTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
-	db, err := poolFrom(ctx)
-	if err != nil {
-		return "", err
-	}
-	var in struct {
-		Name  string `json:"name"`
-		Floor int    `json:"floor"`
-	}
-	if err := json.Unmarshal(args, &in); err != nil {
-		return "", err
-	}
-	_, err = db.Exec(context.Background(),
-		`INSERT INTO rooms (name, floor) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
-		in.Name, in.Floor)
-	if err != nil {
-		return "", fmt.Errorf("insert room: %w", err)
-	}
-	return fmt.Sprintf("Room %s (floor %d) added.", in.Name, in.Floor), nil
-}
-
-// ── add_note ─────────────────────────────────────────────────────────────────
-
-type addNoteTool struct{}
-
-func (t *addNoteTool) Def() llm.ToolDef {
-	return llm.ToolDef{
-		Name:        "add_note",
-		Description: "Add or update a note on a room (e.g. maintenance, special requests).",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"room_name": {"type": "string"},
-				"note":      {"type": "string", "description": "The note to set. Empty string clears it."}
-			},
-			"required": ["room_name", "note"]
-		}`),
-	}
-}
-
-func (t *addNoteTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
-	db, err := poolFrom(ctx)
-	if err != nil {
-		return "", err
-	}
-	var in struct {
-		RoomName string `json:"room_name"`
-		Note     string `json:"note"`
-	}
-	if err := json.Unmarshal(args, &in); err != nil {
-		return "", err
-	}
-	_, err = db.Exec(context.Background(),
-		`UPDATE rooms SET notes=$1 WHERE name=$2`, in.Note, in.RoomName)
-	if err != nil {
-		return "", fmt.Errorf("update note: %w", err)
-	}
-	return fmt.Sprintf("Note updated for room %s.", in.RoomName), nil
+	return fmt.Sprintf("OK — %d rows affected", tag.RowsAffected()), nil
 }
