@@ -10,7 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Ensure pgxpool is used (via poolFrom)
+
 // HotelTools groups all hotel management tools.
+// db may be nil at registration time — the actual pool is taken from ToolContext.Extra
+// (injected by BuildExtra in main.go as a *pgxpool.Pool per user).
 type HotelTools struct {
 	db *pgxpool.Pool
 }
@@ -21,16 +25,25 @@ func newHotelTools(db *pgxpool.Pool) *HotelTools {
 
 func (h *HotelTools) Tools() []agent.Tool {
 	return []agent.Tool{
-		&listRoomsTool{h.db},
-		&setOccupiedTool{h.db},
-		&addRoomTool{h.db},
-		&addNoteTool{h.db},
+		&listRoomsTool{},
+		&setOccupiedTool{},
+		&addRoomTool{},
+		&addNoteTool{},
 	}
+}
+
+// poolFrom extracts the per-user *pgxpool.Pool from ToolContext.Extra.
+func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
+	pool, ok := ctx.Extra.(*pgxpool.Pool)
+	if !ok || pool == nil {
+		return nil, fmt.Errorf("no db pool in context")
+	}
+	return pool, nil
 }
 
 // ── list_rooms ──────────────────────────────────────────────────────────────
 
-type listRoomsTool struct{ db *pgxpool.Pool }
+type listRoomsTool struct{}
 
 func (t *listRoomsTool) Def() llm.ToolDef {
 	return llm.ToolDef{
@@ -40,8 +53,12 @@ func (t *listRoomsTool) Def() llm.ToolDef {
 	}
 }
 
-func (t *listRoomsTool) Execute(_ agent.ToolContext, _ json.RawMessage) (string, error) {
-	rows, err := t.db.Query(context.Background(),
+func (t *listRoomsTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
+	rows, err := db.Query(context.Background(),
 		`SELECT id, name, floor, occupied, COALESCE(notes,'') FROM rooms ORDER BY floor, name`)
 	if err != nil {
 		return "", fmt.Errorf("query rooms: %w", err)
@@ -75,7 +92,7 @@ func (t *listRoomsTool) Execute(_ agent.ToolContext, _ json.RawMessage) (string,
 
 // ── set_occupied ─────────────────────────────────────────────────────────────
 
-type setOccupiedTool struct{ db *pgxpool.Pool }
+type setOccupiedTool struct{}
 
 func (t *setOccupiedTool) Def() llm.ToolDef {
 	return llm.ToolDef{
@@ -92,7 +109,11 @@ func (t *setOccupiedTool) Def() llm.ToolDef {
 	}
 }
 
-func (t *setOccupiedTool) Execute(_ agent.ToolContext, args json.RawMessage) (string, error) {
+func (t *setOccupiedTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
 	var in struct {
 		RoomName string `json:"room_name"`
 		Occupied bool   `json:"occupied"`
@@ -100,8 +121,7 @@ func (t *setOccupiedTool) Execute(_ agent.ToolContext, args json.RawMessage) (st
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
 	}
-
-	tag, err := t.db.Exec(context.Background(),
+	tag, err := db.Exec(context.Background(),
 		`UPDATE rooms SET occupied=$1 WHERE name=$2`, in.Occupied, in.RoomName)
 	if err != nil {
 		return "", fmt.Errorf("update room: %w", err)
@@ -118,7 +138,7 @@ func (t *setOccupiedTool) Execute(_ agent.ToolContext, args json.RawMessage) (st
 
 // ── add_room ─────────────────────────────────────────────────────────────────
 
-type addRoomTool struct{ db *pgxpool.Pool }
+type addRoomTool struct{}
 
 func (t *addRoomTool) Def() llm.ToolDef {
 	return llm.ToolDef{
@@ -135,7 +155,11 @@ func (t *addRoomTool) Def() llm.ToolDef {
 	}
 }
 
-func (t *addRoomTool) Execute(_ agent.ToolContext, args json.RawMessage) (string, error) {
+func (t *addRoomTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
 	var in struct {
 		Name  string `json:"name"`
 		Floor int    `json:"floor"`
@@ -143,8 +167,7 @@ func (t *addRoomTool) Execute(_ agent.ToolContext, args json.RawMessage) (string
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
 	}
-
-	_, err := t.db.Exec(context.Background(),
+	_, err = db.Exec(context.Background(),
 		`INSERT INTO rooms (name, floor) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
 		in.Name, in.Floor)
 	if err != nil {
@@ -155,7 +178,7 @@ func (t *addRoomTool) Execute(_ agent.ToolContext, args json.RawMessage) (string
 
 // ── add_note ─────────────────────────────────────────────────────────────────
 
-type addNoteTool struct{ db *pgxpool.Pool }
+type addNoteTool struct{}
 
 func (t *addNoteTool) Def() llm.ToolDef {
 	return llm.ToolDef{
@@ -172,7 +195,11 @@ func (t *addNoteTool) Def() llm.ToolDef {
 	}
 }
 
-func (t *addNoteTool) Execute(_ agent.ToolContext, args json.RawMessage) (string, error) {
+func (t *addNoteTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
 	var in struct {
 		RoomName string `json:"room_name"`
 		Note     string `json:"note"`
@@ -180,8 +207,7 @@ func (t *addNoteTool) Execute(_ agent.ToolContext, args json.RawMessage) (string
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", err
 	}
-
-	_, err := t.db.Exec(context.Background(),
+	_, err = db.Exec(context.Background(),
 		`UPDATE rooms SET notes=$1 WHERE name=$2`, in.Note, in.RoomName)
 	if err != nil {
 		return "", fmt.Errorf("update note: %w", err)
