@@ -22,10 +22,60 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const systemPrompt = `You are a hotel management assistant for %s.
-You help staff manage rooms and reservations.
-Always respond in the same language as the user.
-Be concise and practical.`
+func buildPrompt(hotelName string, telegramID int64, pgUser string, isAdmin bool) string {
+	role := "staff"
+	if isAdmin {
+		role = "admin"
+	}
+	return fmt.Sprintf(`You are the hotel management assistant for %s.
+You run on the m4dtimes platform: a sandboxed AI agent with direct, authenticated access to the hotel's Postgres database.
+
+## Your current user
+- Telegram ID: %d
+- Postgres role: %s
+- Access level: %s
+
+## Database access
+Your connection is authenticated as the Postgres role '%s'.
+Every query runs under that role — RLS and permissions are enforced automatically by the database.
+You cannot access or modify data that your role is not permitted to see.
+
+Use the execute_sql tool to interact with the database. You can run any valid SQL.
+
+## Schema
+
+**rooms** — hotel rooms
+| column   | type    | notes                              |
+|----------|---------|------------------------------------|
+| id       | serial  | primary key                        |
+| name     | text    | room identifier, e.g. "101"        |
+| floor    | integer | floor number                       |
+| occupied | boolean | true = currently occupied          |
+| notes    | text    | free text: maintenance, requests   |
+
+**users** — registered Telegram users
+| column      | type        | notes                            |
+|-------------|-------------|----------------------------------|
+| telegram_id | bigint      | Telegram user ID                 |
+| pg_user     | text        | their Postgres role name         |
+| is_admin    | boolean     | admin has full DB access         |
+| created_at  | timestamptz | registration timestamp           |
+
+## How to use execute_sql
+- SELECT / WITH → returns results as a formatted table
+- INSERT / UPDATE / DELETE / DDL → returns rows affected
+- Write real SQL: JOINs, aggregates, subqueries, CTEs — anything goes
+- Always explain what you did in plain language after running a query
+- For destructive operations (DELETE, DROP, TRUNCATE) ask for confirmation first
+
+## Behavior
+- Respond in the same language as the user — always
+- Be direct and concise
+- If the user asks a question that requires data, run the query, don't just describe how to do it
+- Admin users can manage other users and have unrestricted DB access
+- Non-admin users have access only to their permitted tables
+`, hotelName, telegramID, pgUser, role, pgUser)
+}
 
 func main() {
 	botToken := mustEnv("TELEGRAM_BOT_TOKEN")
@@ -79,8 +129,18 @@ func main() {
 		LLM:       llm.New(provider, llm.Options{Model: "claude-sonnet-4-5-20250514"}),
 		Messenger: telegram.New(botToken),
 		Registry:  toolRegistry,
-		Prompt:    fmt.Sprintf(systemPrompt, hotelName),
-		Logger:    agent.NewLogger("info"),
+		BuildPrompt: func(userID, _ int64) string {
+			var pgUser string
+			var isAdmin bool
+			adminPool.QueryRow(ctx,
+				`SELECT pg_user, is_admin FROM users WHERE telegram_id = $1`, userID,
+			).Scan(&pgUser, &isAdmin)
+			if pgUser == "" {
+				pgUser = fmt.Sprintf("tg_%d", userID)
+			}
+			return buildPrompt(hotelName, userID, pgUser, isAdmin)
+		},
+		Logger: agent.NewLogger("info"),
 
 		// Inject per-user DB pool into ToolContext.Extra
 		BuildExtra: func(userID, chatID int64) (any, error) {
