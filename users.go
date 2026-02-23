@@ -11,12 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type Role string
+
+const (
+	RoleManager Role = "manager"
+	RoleCleaner Role = "cleaner"
+)
+
 // UserRegistry manages per-user Postgres credentials and connection pools.
-// Each Telegram user gets their own Postgres role; the agent connects with
-// that role's credentials so RLS + CURRENT_USER-based policies apply automatically.
 type UserRegistry struct {
-	adminPool *pgxpool.Pool  // superuser — only used for DDL (CREATE ROLE, INSERT users)
-	dbURL     string         // base URL, used to build per-user DSNs
+	adminPool *pgxpool.Pool
+	dbURL     string
 	mu        sync.Mutex
 	pools     map[int64]*pgxpool.Pool
 }
@@ -29,8 +34,7 @@ func newUserRegistry(adminPool *pgxpool.Pool, dbURL string) *UserRegistry {
 	}
 }
 
-// Pool returns the connection pool for a Telegram user.
-// If the user doesn't exist yet, ErrNotRegistered is returned.
+// Pool returns the per-user connection pool. Opens it on first call.
 func (r *UserRegistry) Pool(ctx context.Context, telegramID int64) (*pgxpool.Pool, error) {
 	r.mu.Lock()
 	if p, ok := r.pools[telegramID]; ok {
@@ -39,25 +43,14 @@ func (r *UserRegistry) Pool(ctx context.Context, telegramID int64) (*pgxpool.Poo
 	}
 	r.mu.Unlock()
 
-	// Look up pg_user from the users table (via admin pool)
-	var pgUser string
+	var pgUser, pgPassword string
 	err := r.adminPool.QueryRow(ctx,
-		`SELECT pg_user FROM users WHERE telegram_id = $1`, telegramID,
-	).Scan(&pgUser)
+		`SELECT u.pg_user, c.pg_password
+		 FROM users u JOIN user_credentials c USING (telegram_id)
+		 WHERE u.telegram_id = $1`, telegramID,
+	).Scan(&pgUser, &pgPassword)
 	if err != nil {
 		return nil, fmt.Errorf("user %d not registered", telegramID)
-	}
-
-	// We don't store passwords — use trust auth via the admin pool by switching role
-	// Actually we store the password in the pool config DSN at registration time.
-	// Here we re-open the pool from env (each user's role is a Postgres LOGIN role).
-	// For simplicity we store the DSN in a separate table. Let's fetch it.
-	var pgPassword string
-	err = r.adminPool.QueryRow(ctx,
-		`SELECT pg_password FROM user_credentials WHERE telegram_id = $1`, telegramID,
-	).Scan(&pgPassword)
-	if err != nil {
-		return nil, fmt.Errorf("credentials for user %d not found: %w", telegramID, err)
 	}
 
 	pool, err := r.openUserPool(ctx, pgUser, pgPassword)
@@ -68,71 +61,71 @@ func (r *UserRegistry) Pool(ctx context.Context, telegramID int64) (*pgxpool.Poo
 	r.mu.Lock()
 	r.pools[telegramID] = pool
 	r.mu.Unlock()
-
 	return pool, nil
 }
 
-// Register creates a Postgres role for the given Telegram user and stores credentials.
-// isAdmin grants elevated permissions (e.g. can see all rooms).
-func (r *UserRegistry) Register(ctx context.Context, telegramID int64, isAdmin bool) error {
+// Register creates a Postgres role and registers the user.
+func (r *UserRegistry) Register(ctx context.Context, telegramID int64, role Role, name string) error {
 	pgUser := fmt.Sprintf("tg_%d", telegramID)
 	pgPassword, err := randomPassword()
 	if err != nil {
 		return fmt.Errorf("generate password: %w", err)
 	}
 
-	// Create Postgres LOGIN role (ignore if already exists)
-	_, err = r.adminPool.Exec(ctx,
-		fmt.Sprintf(`DO $$ BEGIN
+	// Create or update the Postgres LOGIN role
+	_, err = r.adminPool.Exec(ctx, fmt.Sprintf(
+		`DO $$ BEGIN
 			CREATE ROLE %s LOGIN PASSWORD '%s';
 		EXCEPTION WHEN duplicate_object THEN
 			ALTER ROLE %s LOGIN PASSWORD '%s';
 		END $$`, pgUser, pgPassword, pgUser, pgPassword))
 	if err != nil {
-		return fmt.Errorf("create role %s: %w", pgUser, err)
+		return fmt.Errorf("create role: %w", err)
 	}
 
-	// Grant base permissions
+	// Base grants for all users
 	grants := []string{
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE m4dtimes TO %s`, pgUser),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, pgUser),
+		// Tables: RLS policies will restrict what they can actually do
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON rooms TO %s`, pgUser),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON assignments TO %s`, pgUser),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON users TO %s`, pgUser),
 		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, pgUser),
-		fmt.Sprintf(`GRANT SELECT ON users TO %s`, pgUser),
-	}
-	if isAdmin {
-		grants = append(grants, fmt.Sprintf(`GRANT ALL ON ALL TABLES IN SCHEMA public TO %s`, pgUser))
 	}
 	for _, g := range grants {
 		if _, err := r.adminPool.Exec(ctx, g); err != nil {
-			log.Printf("grant for %s: %v", pgUser, err)
+			log.Printf("warn: grant for %s: %v", pgUser, err)
 		}
 	}
 
-	// Store in users + credentials tables
+	// Upsert into users table
 	_, err = r.adminPool.Exec(ctx,
-		`INSERT INTO users (telegram_id, pg_user, is_admin) VALUES ($1, $2, $3)
-		 ON CONFLICT (telegram_id) DO UPDATE SET pg_user=$2, is_admin=$3`,
-		telegramID, pgUser, isAdmin,
+		`INSERT INTO users (telegram_id, pg_user, name, role)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (telegram_id) DO UPDATE SET pg_user=$2, name=$3, role=$4`,
+		telegramID, pgUser, name, string(role),
 	)
 	if err != nil {
-		return fmt.Errorf("insert user: %w", err)
+		return fmt.Errorf("upsert user: %w", err)
 	}
 
+	// Upsert credentials
 	_, err = r.adminPool.Exec(ctx,
-		`INSERT INTO user_credentials (telegram_id, pg_password) VALUES ($1, $2)
+		`INSERT INTO user_credentials (telegram_id, pg_password)
+		 VALUES ($1, $2)
 		 ON CONFLICT (telegram_id) DO UPDATE SET pg_password=$2`,
 		telegramID, pgPassword,
 	)
 	if err != nil {
-		return fmt.Errorf("insert credentials: %w", err)
+		return fmt.Errorf("upsert credentials: %w", err)
 	}
 
-	log.Printf("registered user %d as %s (admin=%v)", telegramID, pgUser, isAdmin)
+	log.Printf("registered user %d (%s) as %s role=%s", telegramID, name, pgUser, role)
 	return nil
 }
 
-// IsRegistered returns true if the user has credentials in the DB.
+// IsRegistered returns true if the user exists in the DB.
 func (r *UserRegistry) IsRegistered(ctx context.Context, telegramID int64) bool {
 	var exists bool
 	r.adminPool.QueryRow(ctx,
@@ -142,9 +135,6 @@ func (r *UserRegistry) IsRegistered(ctx context.Context, telegramID int64) bool 
 }
 
 func (r *UserRegistry) openUserPool(ctx context.Context, pgUser, pgPassword string) (*pgxpool.Pool, error) {
-	// Build DSN from base URL, replacing user+password
-	// Base URL format: postgresql://postgres:devpassword@host:port/db
-	// We swap user+pass, keep host/port/db
 	cfg, err := pgxpool.ParseConfig(r.dbURL)
 	if err != nil {
 		return nil, err
