@@ -8,22 +8,26 @@ import (
 
 	"github.com/dmorn/m4dtimes/sdk/agent"
 	"github.com/dmorn/m4dtimes/sdk/llm"
+	"github.com/dmorn/m4dtimes/sdk/telegram"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type HotelTools struct {
-	registry *UserRegistry
-	botName  string // e.g. "cimon_hotel_bot"
+	registry  *UserRegistry
+	botName   string // e.g. "cimon_hotel_bot"
+	botToken  string // Telegram bot token for outbound messages
+	adminPool *pgxpool.Pool
 }
 
-func newHotelTools(registry *UserRegistry, botName string) *HotelTools {
-	return &HotelTools{registry: registry, botName: botName}
+func newHotelTools(registry *UserRegistry, botName, botToken string, adminPool *pgxpool.Pool) *HotelTools {
+	return &HotelTools{registry: registry, botName: botName, botToken: botToken, adminPool: adminPool}
 }
 
 func (h *HotelTools) Tools() []agent.Tool {
 	return []agent.Tool{
 		&executeSQLTool{},
 		&generateInviteTool{registry: h.registry, botName: h.botName},
+		&sendUserMessageTool{adminPool: h.adminPool, botToken: h.botToken},
 	}
 }
 
@@ -173,4 +177,117 @@ func (t *executeSQLTool) Execute(ctx agent.ToolContext, args json.RawMessage) (s
 		return "", fmt.Errorf("exec: %w", err)
 	}
 	return fmt.Sprintf("OK — %d rows affected", tag.RowsAffected()), nil
+}
+
+// ── send_user_message ────────────────────────────────────────────────────────
+
+type sendUserMessageTool struct {
+	adminPool *pgxpool.Pool
+	botToken  string
+}
+
+func (t *sendUserMessageTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name: "send_user_message",
+		Description: "Invia un messaggio Telegram a uno o più utenti registrati. " +
+			"Puoi specificare un nome utente specifico oppure un ruolo ('manager' o 'cleaner') per inviare a tutti gli utenti con quel ruolo. " +
+			"Usa 'all' come destinatario per inviare a tutti gli utenti registrati.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"to": {
+					"type": "string",
+					"description": "Nome dell'utente (es. 'Mario'), ruolo ('manager' o 'cleaner'), oppure 'all' per tutti"
+				},
+				"message": {
+					"type": "string",
+					"description": "Il testo del messaggio da inviare"
+				}
+			},
+			"required": ["to", "message"]
+		}`),
+	}
+}
+
+func (t *sendUserMessageTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	var in struct {
+		To      string `json:"to"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if in.To == "" || in.Message == "" {
+		return "", fmt.Errorf("to and message are required")
+	}
+
+	// Resolve recipients from the DB
+	type recipient struct {
+		telegramID int64
+		name       string
+	}
+	var recipients []recipient
+
+	bg := context.Background()
+	to := strings.ToLower(strings.TrimSpace(in.To))
+
+	var query string
+	var queryArgs []any
+
+	switch to {
+	case "all":
+		query = `SELECT telegram_id, COALESCE(name, '') FROM users`
+	case "manager", "cleaner":
+		query = `SELECT telegram_id, COALESCE(name, '') FROM users WHERE role = $1`
+		queryArgs = []any{to}
+	default:
+		// Match by name (case-insensitive)
+		query = `SELECT telegram_id, COALESCE(name, '') FROM users WHERE lower(name) = lower($1)`
+		queryArgs = []any{in.To}
+	}
+
+	dbRows, err := t.adminPool.Query(bg, query, queryArgs...)
+	if err != nil {
+		return "", fmt.Errorf("query recipients: %w", err)
+	}
+	defer dbRows.Close()
+
+	for dbRows.Next() {
+		var r recipient
+		if err := dbRows.Scan(&r.telegramID, &r.name); err != nil {
+			return "", fmt.Errorf("scan recipient: %w", err)
+		}
+		// Don't send to self
+		if r.telegramID != ctx.UserID {
+			recipients = append(recipients, r)
+		}
+	}
+
+	if len(recipients) == 0 {
+		return "⚠️ Nessun utente trovato per il destinatario specificato.", nil
+	}
+
+	tg := telegram.New(t.botToken)
+	var sent, failed int
+	var sentNames []string
+
+	for _, r := range recipients {
+		// In Telegram, the chat_id for a DM equals the user's telegram_id
+		if err := tg.Send(bg, r.telegramID, in.Message); err != nil {
+			failed++
+		} else {
+			sent++
+			name := r.name
+			if name == "" {
+				name = fmt.Sprintf("utente %d", r.telegramID)
+			}
+			sentNames = append(sentNames, name)
+		}
+	}
+
+	result := fmt.Sprintf("✅ Messaggio inviato a %d utente/i: %s", sent, strings.Join(sentNames, ", "))
+	if failed > 0 {
+		result += fmt.Sprintf("\n⚠️ %d invio/i fallito/i.", failed)
+	}
+	return result, nil
 }

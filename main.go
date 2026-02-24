@@ -66,7 +66,7 @@ func main() {
 	}
 
 	toolRegistry := agent.NewToolRegistry()
-	toolRegistry.RegisterToolSet(newHotelTools(registry, botName))
+	toolRegistry.RegisterToolSet(newHotelTools(registry, botName, botToken, adminPool))
 
 	a := agent.New(agent.Options{
 		LLM:       llm.New(provider, llm.Options{Model: llmModel}),
