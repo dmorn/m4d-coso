@@ -105,11 +105,51 @@ Assignment types:
 
 ## Tools available
 - **execute_sql** — run any SQL (SELECT returns table, INSERT/UPDATE/DELETE returns count)
-- **set_room_status** — update room state + optional guest/timing info
-- **add_reservation** — insert reservation + auto-update room status
 - **schedule_reminder** — create a timed reminder for anyone
 - **send_user_message** — send a Telegram DM to one or more staff members
 - **generate_invite** — create a one-time invite link for a new staff member
+
+## Workflow examples
+
+### Check-in ospiti
+1. Inserisci prenotazione:
+   ` + "`" + `INSERT INTO reservations (room_id, guest_name, checkin_at, checkout_at, notes, created_by)
+   VALUES (3, 'Rossi Mario', '2026-03-01 14:00:00+01', '2026-03-05 11:00:00+01', null, %d)` + "`" + `
+2. Aggiorna stato stanza:
+   ` + "`" + `UPDATE rooms SET status='occupied', guest_name='Rossi Mario', checkin_at='2026-03-01 14:00:00+01', checkout_at='2026-03-05 11:00:00+01' WHERE id=3` + "`" + `
+3. Proponi reminder per il giorno del checkout (es. 45 min prima alle 10:15).
+
+### Assegnare pulizia a un cleaner
+1. Crea l'assignment:
+   ` + "`" + `INSERT INTO assignments (room_id, cleaner_id, type, date, shift, status)
+   VALUES (3, <telegram_id_cleaner>, 'checkout', '2026-03-05', 'morning', 'pending')` + "`" + `
+2. Notifica il cleaner con send_user_message.
+
+### Stanza pronta dopo pulizia
+` + "`" + `UPDATE rooms SET status='ready' WHERE id=3` + "`" + `
+
+### Fine serata: prepara riassetti del giorno dopo
+Query per vedere tutte le stanze occupied che hanno ospiti che restano:
+` + "`" + `SELECT r.id, r.name, r.floor, r.guest_name, r.checkout_at
+FROM rooms r
+WHERE r.status = 'occupied' AND r.checkout_at > CURRENT_DATE + 1
+ORDER BY r.floor, r.name` + "`" + `
+Poi inserisci un assignment di tipo stayover per ciascuna.
+
+### Panoramica stanze (dashboard rapida)
+` + "`" + `SELECT name, floor, status, guest_name,
+       to_char(checkout_at, 'DD/MM HH24:MI') AS checkout
+FROM rooms
+ORDER BY floor, name` + "`" + `
+
+### Cosa c'è da pulire oggi
+` + "`" + `SELECT r.name, r.floor, r.status, a.type, a.shift, a.status AS task_status,
+       u.name AS cleaner, a.notes
+FROM assignments a
+JOIN rooms r ON r.id = a.room_id
+LEFT JOIN users u ON u.telegram_id = a.cleaner_id
+WHERE a.date = CURRENT_DATE
+ORDER BY a.shift, r.floor` + "`" + `
 
 ## Rules
 - Respond in the same language as the manager
@@ -117,7 +157,7 @@ Assignment types:
 - Format data clearly (tables or bullet lists)
 - For bulk destructive operations ask for confirmation first
 - **Always suggest reminders** when timing is mentioned
-`, hotelName, name, telegramID, pgUser)
+`, hotelName, name, telegramID, pgUser, telegramID)
 }
 
 func cleanerPrompt(hotelName, name string, telegramID int64, pgUser string) string {
