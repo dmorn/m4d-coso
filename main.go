@@ -26,6 +26,7 @@ func main() {
 	botToken := mustEnv("TELEGRAM_BOT_TOKEN")
 	dbURL := envOr("DATABASE_URL", "postgresql://postgres:devpassword@localhost:5432/m4dtimes")
 	hotelName := envOr("HOTEL_NAME", "Hotel Cimon")
+	llmModel := envOr("LLM_MODEL", "claude-3-5-sonnet-20241022")
 	adminTelegramID := int64(7756297856) // Dani
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -66,7 +67,7 @@ func main() {
 	toolRegistry.RegisterToolSet(newHotelTools())
 
 	a := agent.New(agent.Options{
-		LLM:       llm.New(provider, llm.Options{Model: "claude-3-5-sonnet-20241022"}),
+		LLM:       llm.New(provider, llm.Options{Model: llmModel}),
 		Messenger: telegram.New(botToken),
 		Registry:  toolRegistry,
 		Logger:    agent.NewLogger("info"),
