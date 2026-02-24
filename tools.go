@@ -284,6 +284,15 @@ func (t *sendUserMessageTool) Execute(ctx agent.ToolContext, args json.RawMessag
 				name = fmt.Sprintf("utente %d", r.telegramID)
 			}
 			sentNames = append(sentNames, name)
+
+			// Inject the sent message into the recipient's conversation context
+			// so their next LLM turn has full awareness of what was said to them.
+			if ctx.ContextInjector != nil {
+				ctx.ContextInjector.Inject(r.telegramID, llm.Message{
+					Role: "assistant",
+					Content: []llm.ContentBlock{{Type: "text", Text: in.Message}},
+				})
+			}
 		}
 	}
 

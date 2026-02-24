@@ -7,6 +7,8 @@ github.com/dmorn/m4dtimes v0.0.0-20260224122137-418a186920be h1:9NgjabviXQHz2MXh
 github.com/dmorn/m4dtimes v0.0.0-20260224122137-418a186920be/go.mod h1:p6nlZFGJig2f+Y2g5JIPA0LAE3ZfMd0JZf5E0qwNNkw=
 github.com/dmorn/m4dtimes v0.0.0-20260224155627-9d9a122e14f9 h1:SaENGDHYl4Ht9b5Mz2g84hR2plowCm0wJLnDKAH1v08=
 github.com/dmorn/m4dtimes v0.0.0-20260224155627-9d9a122e14f9/go.mod h1:p6nlZFGJig2f+Y2g5JIPA0LAE3ZfMd0JZf5E0qwNNkw=
+github.com/dmorn/m4dtimes v0.0.0-20260224182612-678617ebe6fe h1:ZYG6oiIfm8HXTiurJSL3l6Ff/65XOlVQj7yXHR5gcrI=
+github.com/dmorn/m4dtimes v0.0.0-20260224182612-678617ebe6fe/go.mod h1:p6nlZFGJig2f+Y2g5JIPA0LAE3ZfMd0JZf5E0qwNNkw=
 github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
 github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
 github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
