@@ -3,7 +3,7 @@ module github.com/dmorn/m4d-coso
 go 1.24.0
 
 require (
-	github.com/dmorn/m4dtimes v0.0.0-20260224120656-de31f7d2079f
+	github.com/dmorn/m4dtimes v0.0.0-20260224122137-418a186920be
 	github.com/jackc/pgx/v5 v5.8.0
 )
 
