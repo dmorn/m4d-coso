@@ -19,6 +19,7 @@ import (
 
 	"github.com/dmorn/m4dtimes/sdk/agent"
 	"github.com/dmorn/m4dtimes/sdk/llm"
+	"github.com/dmorn/m4dtimes/sdk/session"
 	"github.com/dmorn/m4dtimes/sdk/telegram"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -65,6 +66,14 @@ func main() {
 		log.Fatalf("llm provider: %v", err)
 	}
 
+	sessionDir := envOr("SESSION_DIR", "./sessions")
+	sessionStore, err := session.NewStore(sessionDir)
+	if err != nil {
+		log.Fatalf("session store: %v", err)
+	}
+	defer sessionStore.Close()
+	log.Printf("session store: writing to %s", sessionDir)
+
 	toolRegistry := agent.NewToolRegistry()
 	toolRegistry.RegisterToolSet(newHotelTools(registry, botName, botToken, adminPool))
 
@@ -73,6 +82,7 @@ func main() {
 		Messenger: telegram.New(botToken),
 		Registry:  toolRegistry,
 		Logger:    agent.NewLogger("info"),
+		Session:   sessionStore,
 
 		// HandleStart — deep-link invite redemption via /start <token>.
 		// Runs BEFORE Authorize so unregistered users can onboard themselves.
