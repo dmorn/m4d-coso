@@ -60,6 +60,21 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 
+		// ── Invites ───────────────────────────────────────────────────────────
+		// Single-use tokens for Telegram deep-link onboarding (/start TOKEN).
+		// Must be created before the re-grant loop below references it.
+		`CREATE TABLE IF NOT EXISTS invites (
+			id         BIGSERIAL PRIMARY KEY,
+			token      TEXT UNIQUE NOT NULL,
+			role       TEXT NOT NULL CHECK (role IN ('manager','cleaner')),
+			name       TEXT NOT NULL,
+			created_by BIGINT NOT NULL REFERENCES users(telegram_id),
+			used_by    BIGINT REFERENCES users(telegram_id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			used_at    TIMESTAMPTZ,
+			expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '7 days'
+		)`,
+
 		// ── Helper functions ─────────────────────────────────────────────────
 
 		// current_telegram_id() — maps the session's login role → telegram_id.
@@ -164,21 +179,6 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			WITH CHECK (is_manager() OR cleaner_id = current_telegram_id())`,
 		`CREATE POLICY assignments_delete ON assignments FOR DELETE
 			USING (is_manager())`,
-
-		// ── invites ───────────────────────────────────────────────────────────
-		// Single-use tokens for Telegram deep-link onboarding (/start TOKEN).
-		// Link format: https://t.me/cimon_hotel_bot?start=<token>
-		`CREATE TABLE IF NOT EXISTS invites (
-			id         BIGSERIAL PRIMARY KEY,
-			token      TEXT UNIQUE NOT NULL,
-			role       TEXT NOT NULL CHECK (role IN ('manager','cleaner')),
-			name       TEXT NOT NULL,
-			created_by BIGINT NOT NULL REFERENCES users(telegram_id),
-			used_by    BIGINT REFERENCES users(telegram_id),
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			used_at    TIMESTAMPTZ,
-			expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '7 days'
-		)`,
 
 		// ── users ─────────────────────────────────────────────────────────────
 		// SELECT: everyone (cleaners need to see colleagues' names/shifts)
