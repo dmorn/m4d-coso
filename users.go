@@ -83,14 +83,17 @@ func (r *UserRegistry) Register(ctx context.Context, telegramID int64, role Role
 		return fmt.Errorf("create role: %w", err)
 	}
 
-	// Base grants for all users
+	// Base grants for all users — must match the re-grant loop in ensureSchema
+	// so that users registered mid-session get the same access as boot-time users.
 	grants := []string{
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE m4dtimes TO %s`, pgUser),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, pgUser),
-		// Tables: RLS policies will restrict what they can actually do
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON rooms TO %s`, pgUser),
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON assignments TO %s`, pgUser),
 		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON users TO %s`, pgUser),
+		fmt.Sprintf(`GRANT SELECT ON invites TO %s`, pgUser),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON reservations TO %s`, pgUser),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON reminders TO %s`, pgUser),
 		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, pgUser),
 	}
 	for _, g := range grants {
@@ -98,6 +101,16 @@ func (r *UserRegistry) Register(ctx context.Context, telegramID int64, role Role
 			log.Printf("warn: grant for %s: %v", pgUser, err)
 		}
 	}
+
+	// Invalidate cached pool: Register may change the pg_password, so any
+	// existing pool for this user must be evicted to avoid stale credentials.
+	r.mu.Lock()
+	if old, ok := r.pools[telegramID]; ok {
+		old.Close()
+		delete(r.pools, telegramID)
+		log.Printf("evicted stale pool for user %d after re-registration", telegramID)
+	}
+	r.mu.Unlock()
 
 	// Upsert into users table
 	_, err = r.adminPool.Exec(ctx,
