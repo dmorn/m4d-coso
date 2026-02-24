@@ -66,7 +66,7 @@ func main() {
 	toolRegistry.RegisterToolSet(newHotelTools())
 
 	a := agent.New(agent.Options{
-		LLM:       llm.New(provider, llm.Options{Model: "claude-sonnet-4-5-20250514"}),
+		LLM:       llm.New(provider, llm.Options{Model: "claude-3-5-sonnet-20241022"}),
 		Messenger: telegram.New(botToken),
 		Registry:  toolRegistry,
 		Logger:    agent.NewLogger("info"),
