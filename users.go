@@ -161,3 +161,67 @@ func randomPassword() (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
+
+// InviteInfo holds the data embedded in an invite row.
+type InviteInfo struct {
+	Token string
+	Role  Role
+	Name  string
+}
+
+// CreateInvite generates a one-time invite token and stores it in the DB.
+// Returns the token on success.
+func (r *UserRegistry) CreateInvite(ctx context.Context, createdBy int64, role Role, name string) (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	token := hex.EncodeToString(b)
+
+	_, err := r.adminPool.Exec(ctx,
+		`INSERT INTO invites (token, role, name, created_by)
+		 VALUES ($1, $2, $3, $4)`,
+		token, string(role), name, createdBy,
+	)
+	if err != nil {
+		return "", fmt.Errorf("insert invite: %w", err)
+	}
+	return token, nil
+}
+
+// LookupInvite returns invite info if the token is valid, unused, and not expired.
+func (r *UserRegistry) LookupInvite(ctx context.Context, token string) (*InviteInfo, error) {
+	var info InviteInfo
+	err := r.adminPool.QueryRow(ctx,
+		`SELECT token, role, name FROM invites
+		 WHERE token = $1
+		   AND used_at IS NULL
+		   AND expires_at > now()`,
+		token,
+	).Scan(&info.Token, &info.Role, &info.Name)
+	if err != nil {
+		return nil, fmt.Errorf("invite not found or expired")
+	}
+	return &info, nil
+}
+
+// UseInvite registers the user and marks the invite as consumed.
+func (r *UserRegistry) UseInvite(ctx context.Context, token string, telegramID int64) (*InviteInfo, error) {
+	info, err := r.LookupInvite(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.Register(ctx, telegramID, info.Role, info.Name); err != nil {
+		return nil, fmt.Errorf("register user: %w", err)
+	}
+
+	_, err = r.adminPool.Exec(ctx,
+		`UPDATE invites SET used_by=$1, used_at=now() WHERE token=$2`,
+		telegramID, token,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("mark invite used: %w", err)
+	}
+	return info, nil
+}
