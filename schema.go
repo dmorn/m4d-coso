@@ -96,6 +96,7 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON rooms TO %I', r);
 				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON assignments TO %I', r);
 				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON users TO %I', r);
+				EXECUTE format('GRANT SELECT ON invites TO %I', r);
 				EXECUTE format('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', r);
 			END LOOP;
 		END $$`,
@@ -164,6 +165,45 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE POLICY assignments_delete ON assignments FOR DELETE
 			USING (is_manager())`,
 
+		// ── invites ───────────────────────────────────────────────────────────
+		// One-time invite tokens for onboarding new users via Telegram deep links.
+		// Link format: https://t.me/cimon_hotel_bot?start=<token>
+		`CREATE TABLE IF NOT EXISTS invites (
+			id         BIGSERIAL PRIMARY KEY,
+			token      TEXT UNIQUE NOT NULL,
+			role       TEXT NOT NULL CHECK (role IN ('manager', 'cleaner')),
+			name       TEXT NOT NULL,
+			created_by BIGINT NOT NULL REFERENCES users(telegram_id),
+			used_by    BIGINT REFERENCES users(telegram_id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			used_at    TIMESTAMPTZ,
+			expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '7 days'
+		)`,
+
+		// ── Invites ───────────────────────────────────────────────────────────
+		// Single-use tokens for Telegram deep-link onboarding (/start TOKEN).
+		// created_by references a manager; used_by is filled on redemption.
+		`CREATE TABLE IF NOT EXISTS invites (
+			id         BIGSERIAL PRIMARY KEY,
+			token      TEXT UNIQUE NOT NULL,
+			role       TEXT NOT NULL CHECK (role IN ('manager','cleaner')),
+			name       TEXT NOT NULL,
+			created_by BIGINT NOT NULL REFERENCES users(telegram_id),
+			used_by    BIGINT REFERENCES users(telegram_id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			used_at    TIMESTAMPTZ,
+			expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '7 days'
+		)`,
+
+		// ── invites ───────────────────────────────────────────────────────────
+		// Invite management is done via the superuser (adminPool) only.
+		// tg_* roles have SELECT-only access; writes go through admin pool.
+		`ALTER TABLE invites ENABLE ROW LEVEL SECURITY`,
+		`DO $$ BEGIN
+			DROP POLICY IF EXISTS invites_select ON invites;
+		END $$`,
+		`CREATE POLICY invites_select ON invites FOR SELECT USING (is_manager())`,
+
 		// ── users ─────────────────────────────────────────────────────────────
 		// SELECT: everyone (cleaners need to see colleagues' names/shifts)
 		// INSERT: managers only (tg_* roles are created by the system, not by LLM)
@@ -185,6 +225,20 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			USING      (is_manager() OR telegram_id = current_telegram_id())
 			WITH CHECK (is_manager() OR telegram_id = current_telegram_id())`,
 		`CREATE POLICY users_delete ON users FOR DELETE USING (is_manager())`,
+
+		// ── invites ───────────────────────────────────────────────────────────
+		// Only managers can create invites; everyone can read their own (for
+		// confirmation messages). Marking as used is done by the superuser pool.
+		`ALTER TABLE invites ENABLE ROW LEVEL SECURITY`,
+		`DO $$ BEGIN
+			DROP POLICY IF EXISTS invites_select ON invites;
+			DROP POLICY IF EXISTS invites_insert ON invites;
+		END $$`,
+		// Managers see all invites; a cleaner can only see invites they redeemed
+		`CREATE POLICY invites_select ON invites FOR SELECT
+			USING (is_manager() OR used_by = current_telegram_id())`,
+		`CREATE POLICY invites_insert ON invites FOR INSERT
+			WITH CHECK (is_manager())`,
 	}
 
 	for _, s := range stmts {

@@ -16,4 +16,4 @@ require (
 	golang.org/x/text v0.29.0 // indirect
 )
 
-replace github.com/dmorn/m4dtimes => ../m4dtimes
+replace github.com/dmorn/m4dtimes => /tmp/wt-authorize

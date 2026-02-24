@@ -11,12 +11,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type HotelTools struct{}
+type HotelTools struct {
+	registry *UserRegistry
+	botName  string // e.g. "cimon_hotel_bot"
+}
 
-func newHotelTools() *HotelTools { return &HotelTools{} }
+func newHotelTools(registry *UserRegistry, botName string) *HotelTools {
+	return &HotelTools{registry: registry, botName: botName}
+}
 
 func (h *HotelTools) Tools() []agent.Tool {
-	return []agent.Tool{&executeSQLTool{}}
+	return []agent.Tool{
+		&executeSQLTool{},
+		&generateInviteTool{registry: h.registry, botName: h.botName},
+	}
 }
 
 func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
@@ -25,6 +33,64 @@ func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("no db pool in context")
 	}
 	return pool, nil
+}
+
+// ── generate_invite ──────────────────────────────────────────────────────────
+
+type generateInviteTool struct {
+	registry *UserRegistry
+	botName  string
+}
+
+func (t *generateInviteTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name:        "generate_invite",
+		Description: "Genera un link di invito per un nuovo utente. Solo i manager possono usare questo tool. Restituisce un link Telegram da condividere con la persona.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"name": {
+					"type": "string",
+					"description": "Nome della persona da invitare"
+				},
+				"role": {
+					"type": "string",
+					"enum": ["cleaner", "manager"],
+					"description": "Ruolo da assegnare: 'cleaner' per le cameriere, 'manager' per i responsabili"
+				}
+			},
+			"required": ["name", "role"]
+		}`),
+	}
+}
+
+func (t *generateInviteTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	var in struct {
+		Name string `json:"name"`
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if in.Name == "" || in.Role == "" {
+		return "", fmt.Errorf("name and role are required")
+	}
+
+	role := Role(in.Role)
+	if role != RoleManager && role != RoleCleaner {
+		return "", fmt.Errorf("invalid role: %s", in.Role)
+	}
+
+	token, err := t.registry.CreateInvite(context.Background(), ctx.UserID, role, in.Name)
+	if err != nil {
+		return "", fmt.Errorf("create invite: %w", err)
+	}
+
+	link := fmt.Sprintf("https://t.me/%s?start=%s", t.botName, token)
+	return fmt.Sprintf(
+		"✅ Invito creato per %s (%s):\n%s\n\n⚠️ Il link scade tra 7 giorni ed è monouso.",
+		in.Name, in.Role, link,
+	), nil
 }
 
 // ── execute_sql ──────────────────────────────────────────────────────────────
