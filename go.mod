@@ -3,7 +3,7 @@ module github.com/dmorn/m4d-coso
 go 1.24.0
 
 require (
-	github.com/dmorn/m4dtimes v0.0.0-00010101000000-000000000000
+	github.com/dmorn/m4dtimes v0.0.0-20260224114221-c03ab084b435
 	github.com/jackc/pgx/v5 v5.8.0
 )
 
@@ -15,5 +15,3 @@ require (
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 )
-
-replace github.com/dmorn/m4dtimes => /tmp/wt-authorize
