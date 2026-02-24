@@ -215,12 +215,16 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE POLICY rooms_delete ON rooms FOR DELETE USING (is_manager())`,
 
 		// ── assignments ───────────────────────────────────────────────────────
-		// SELECT: everyone (cleaners need to see their schedule)
-		// INSERT: managers only
-		// UPDATE: managers can change anything; cleaners can only touch their own
-		//         rows — AND the resulting row must still belong to them
-		//         (WITH CHECK prevents re-assigning cleaner_id to someone else)
-		// DELETE: managers only
+		// SELECT: everyone (cleaners need to see all room assignments)
+		// INSERT: managers can insert any row; cleaners can self-assign (cleaner_id
+		//         must equal their own telegram_id — WITH CHECK enforces this).
+		//         Multiple cleaners can claim the same room/date/type (each gets
+		//         their own row). Type must match room status: checkout_due →
+		//         'checkout', stayover_due → 'stayover'.
+		// UPDATE: managers any row; cleaners only their own, and cannot change
+		//         cleaner_id (WITH CHECK prevents re-assignment to someone else).
+		// DELETE: managers any row; cleaners can retract their own claim only if
+		//         status is still 'pending' (not yet started).
 		`ALTER TABLE assignments ENABLE ROW LEVEL SECURITY`,
 		`DO $$ BEGIN
 			DROP POLICY IF EXISTS assignments_select ON assignments;
@@ -230,12 +234,12 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		END $$`,
 		`CREATE POLICY assignments_select ON assignments FOR SELECT USING (true)`,
 		`CREATE POLICY assignments_insert ON assignments FOR INSERT
-			WITH CHECK (is_manager())`,
+			WITH CHECK (is_manager() OR cleaner_id = current_telegram_id())`,
 		`CREATE POLICY assignments_update ON assignments FOR UPDATE
 			USING      (is_manager() OR cleaner_id = current_telegram_id())
 			WITH CHECK (is_manager() OR cleaner_id = current_telegram_id())`,
 		`CREATE POLICY assignments_delete ON assignments FOR DELETE
-			USING (is_manager())`,
+			USING (is_manager() OR (cleaner_id = current_telegram_id() AND status = 'pending'))`,
 
 		// ── users ─────────────────────────────────────────────────────────────
 		// SELECT: everyone (cleaners need to see colleagues' names/shifts)
