@@ -39,11 +39,31 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 
 		// ── Rooms ─────────────────────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS rooms (
-			id       SERIAL PRIMARY KEY,
-			name     TEXT NOT NULL UNIQUE,
-			floor    INT NOT NULL DEFAULT 1,
-			notes    TEXT
+			id          SERIAL PRIMARY KEY,
+			name        TEXT NOT NULL UNIQUE,
+			floor       INT NOT NULL DEFAULT 1,
+			notes       TEXT,
+			status      TEXT NOT NULL DEFAULT 'available'
+			            CHECK (status IN (
+			            	'available',      -- libera e pulita
+			            	'occupied',       -- ospiti presenti
+			            	'stayover_due',   -- ospiti rimangono, riassetto da fare oggi
+			            	'checkout_due',   -- checkout oggi, pulizia completa
+			            	'cleaning',       -- cameriera al lavoro
+			            	'ready',          -- pulita, pronta per check-in
+			            	'out_of_service'  -- manutenzione
+			            )),
+			guest_name  TEXT,
+			checkin_at  TIMESTAMPTZ,
+			checkout_at TIMESTAMPTZ
 		)`,
+		// Migrations for rooms (idempotent)
+		`DO $$ BEGIN
+			ALTER TABLE rooms ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'available';
+			ALTER TABLE rooms ADD COLUMN IF NOT EXISTS guest_name TEXT;
+			ALTER TABLE rooms ADD COLUMN IF NOT EXISTS checkin_at TIMESTAMPTZ;
+			ALTER TABLE rooms ADD COLUMN IF NOT EXISTS checkout_at TIMESTAMPTZ;
+		EXCEPTION WHEN others THEN NULL; END $$`,
 
 		// ── Assignments ───────────────────────────────────────────────────────
 		// A cleaner is assigned to clean a room on a given date/shift.
@@ -51,6 +71,8 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			id          SERIAL PRIMARY KEY,
 			room_id     INT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
 			cleaner_id  BIGINT NOT NULL REFERENCES users(telegram_id),
+			type        TEXT NOT NULL DEFAULT 'checkout'
+			            CHECK (type IN ('stayover', 'checkout')),
 			date        DATE NOT NULL DEFAULT CURRENT_DATE,
 			shift       TEXT NOT NULL DEFAULT 'morning'
 			            CHECK (shift IN ('morning', 'afternoon', 'evening')),
@@ -59,6 +81,39 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			notes       TEXT,
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Migrations for assignments
+		`DO $$ BEGIN
+			ALTER TABLE assignments ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'checkout';
+		EXCEPTION WHEN others THEN NULL; END $$`,
+
+		// ── Reservations ──────────────────────────────────────────────────────
+		// Manager-entered reservations. Drive automatic room status transitions.
+		`CREATE TABLE IF NOT EXISTS reservations (
+			id          BIGSERIAL PRIMARY KEY,
+			room_id     INT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+			guest_name  TEXT,
+			checkin_at  TIMESTAMPTZ NOT NULL,
+			checkout_at TIMESTAMPTZ NOT NULL,
+			notes       TEXT,
+			created_by  BIGINT NOT NULL REFERENCES users(telegram_id),
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+
+		// ── Reminders ─────────────────────────────────────────────────────────
+		// Anyone can schedule reminders for themselves or others.
+		// A background goroutine fires them and marks fired_at.
+		`CREATE TABLE IF NOT EXISTS reminders (
+			id          BIGSERIAL PRIMARY KEY,
+			fire_at     TIMESTAMPTZ NOT NULL,
+			chat_id     BIGINT NOT NULL,
+			message     TEXT NOT NULL,
+			room_id     INT REFERENCES rooms(id) ON DELETE SET NULL,
+			created_by  BIGINT NOT NULL REFERENCES users(telegram_id),
+			fired_at    TIMESTAMPTZ,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS reminders_pending_idx
+			ON reminders (fire_at) WHERE fired_at IS NULL`,
 
 		// ── Invites ───────────────────────────────────────────────────────────
 		// Single-use tokens for Telegram deep-link onboarding (/start TOKEN).
@@ -112,6 +167,8 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON assignments TO %I', r);
 				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON users TO %I', r);
 				EXECUTE format('GRANT SELECT ON invites TO %I', r);
+				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON reservations TO %I', r);
+				EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON reminders TO %I', r);
 				EXECUTE format('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', r);
 			END LOOP;
 		END $$`,
@@ -215,6 +272,42 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 			USING (is_manager() OR used_by = current_telegram_id())`,
 		`CREATE POLICY invites_insert ON invites FOR INSERT
 			WITH CHECK (is_manager())`,
+
+		// ── reservations ──────────────────────────────────────────────────────
+		// Everyone can see reservations (cleaners need context).
+		// Only managers can insert/update/delete.
+		`ALTER TABLE reservations ENABLE ROW LEVEL SECURITY`,
+		`DO $$ BEGIN
+			DROP POLICY IF EXISTS reservations_select ON reservations;
+			DROP POLICY IF EXISTS reservations_insert ON reservations;
+			DROP POLICY IF EXISTS reservations_update ON reservations;
+			DROP POLICY IF EXISTS reservations_delete ON reservations;
+		END $$`,
+		`CREATE POLICY reservations_select ON reservations FOR SELECT USING (true)`,
+		`CREATE POLICY reservations_insert ON reservations FOR INSERT WITH CHECK (is_manager())`,
+		`CREATE POLICY reservations_update ON reservations FOR UPDATE
+			USING (is_manager()) WITH CHECK (is_manager())`,
+		`CREATE POLICY reservations_delete ON reservations FOR DELETE USING (is_manager())`,
+
+		// ── reminders ─────────────────────────────────────────────────────────
+		// Everyone can create and manage their own reminders.
+		// Managers can see all reminders.
+		`ALTER TABLE reminders ENABLE ROW LEVEL SECURITY`,
+		`DO $$ BEGIN
+			DROP POLICY IF EXISTS reminders_select ON reminders;
+			DROP POLICY IF EXISTS reminders_insert ON reminders;
+			DROP POLICY IF EXISTS reminders_update ON reminders;
+			DROP POLICY IF EXISTS reminders_delete ON reminders;
+		END $$`,
+		`CREATE POLICY reminders_select ON reminders FOR SELECT
+			USING (is_manager() OR created_by = current_telegram_id())`,
+		`CREATE POLICY reminders_insert ON reminders FOR INSERT
+			WITH CHECK (created_by = current_telegram_id())`,
+		`CREATE POLICY reminders_update ON reminders FOR UPDATE
+			USING (is_manager() OR created_by = current_telegram_id())
+			WITH CHECK (is_manager() OR created_by = current_telegram_id())`,
+		`CREATE POLICY reminders_delete ON reminders FOR DELETE
+			USING (is_manager() OR created_by = current_telegram_id())`,
 	}
 
 	for _, s := range stmts {

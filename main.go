@@ -133,6 +133,8 @@ func main() {
 		},
 	})
 
+	startReminderLoop(ctx, adminPool, botToken)
+
 	log.Printf("starting %s agent...", hotelName)
 	if err := a.Run(ctx); err != nil {
 		log.Fatalf("agent: %v", err)

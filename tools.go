@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/dmorn/m4dtimes/sdk/agent"
 	"github.com/dmorn/m4dtimes/sdk/llm"
@@ -28,6 +29,9 @@ func (h *HotelTools) Tools() []agent.Tool {
 		&executeSQLTool{},
 		&generateInviteTool{registry: h.registry, botName: h.botName},
 		&sendUserMessageTool{adminPool: h.adminPool, botToken: h.botToken},
+		&scheduleReminderTool{adminPool: h.adminPool},
+		&setRoomStatusTool{},
+		&addReservationTool{adminPool: h.adminPool},
 	}
 }
 
@@ -290,4 +294,310 @@ func (t *sendUserMessageTool) Execute(ctx agent.ToolContext, args json.RawMessag
 		result += fmt.Sprintf("\n⚠️ %d invio/i fallito/i.", failed)
 	}
 	return result, nil
+}
+
+// ── schedule_reminder ────────────────────────────────────────────────────────
+
+type scheduleReminderTool struct {
+	adminPool *pgxpool.Pool
+}
+
+func (t *scheduleReminderTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name: "schedule_reminder",
+		Description: "Programma un reminder che verrà inviato via Telegram a una data/ora precisa. " +
+			"Usa questo tool PROATTIVAMENTE: ogni volta che l'utente menziona un orario, un evento futuro, " +
+			"o dice 'ricordami', proponi o crea subito un reminder. " +
+			"Il destinatario può essere l'utente stesso o un altro membro dello staff (per nome).",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"fire_at": {
+					"type": "string",
+					"description": "Data e ora di invio in formato ISO 8601 con timezone, es. '2026-02-24T10:30:00+01:00'"
+				},
+				"message": {
+					"type": "string",
+					"description": "Testo del reminder da inviare"
+				},
+				"to": {
+					"type": "string",
+					"description": "Destinatario: 'me' per se stessi, oppure nome di un altro utente registrato. Default: 'me'."
+				},
+				"room_id": {
+					"type": "integer",
+					"description": "ID della stanza a cui si riferisce il reminder (opzionale, per contesto)"
+				}
+			},
+			"required": ["fire_at", "message"]
+		}`),
+	}
+}
+
+func (t *scheduleReminderTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	var in struct {
+		FireAt  string `json:"fire_at"`
+		Message string `json:"message"`
+		To      string `json:"to"`
+		RoomID  *int64 `json:"room_id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+	if in.FireAt == "" || in.Message == "" {
+		return "", fmt.Errorf("fire_at and message are required")
+	}
+
+	fireAt, err := time.Parse(time.RFC3339, in.FireAt)
+	if err != nil {
+		return "", fmt.Errorf("invalid fire_at format, use ISO 8601 with timezone (e.g. 2026-02-24T10:30:00+01:00): %w", err)
+	}
+	if fireAt.Before(time.Now()) {
+		return "", fmt.Errorf("fire_at must be in the future")
+	}
+
+	// Resolve destination chat_id
+	chatID := ctx.ChatID // default: self
+	toName := ""
+	if in.To != "" && in.To != "me" && in.To != "io" {
+		var recipientID int64
+		err := t.adminPool.QueryRow(context.Background(),
+			`SELECT telegram_id, name FROM users WHERE lower(name) = lower($1)`, in.To,
+		).Scan(&recipientID, &toName)
+		if err != nil {
+			return "", fmt.Errorf("utente '%s' non trovato", in.To)
+		}
+		chatID = recipientID
+	}
+
+	_, err = t.adminPool.Exec(context.Background(),
+		`INSERT INTO reminders (fire_at, chat_id, message, room_id, created_by)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		fireAt, chatID, in.Message, in.RoomID, ctx.UserID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("insert reminder: %w", err)
+	}
+
+	dest := "te"
+	if toName != "" {
+		dest = toName
+	}
+	return fmt.Sprintf("⏰ Reminder programmato per %s alle %s (destinatario: %s).",
+		fireAt.Format("02/01/2006"), fireAt.Format("15:04"), dest), nil
+}
+
+// ── set_room_status ──────────────────────────────────────────────────────────
+
+type setRoomStatusTool struct{}
+
+func (t *setRoomStatusTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name: "set_room_status",
+		Description: "Aggiorna lo stato di una stanza nel ciclo di vita dell'hotel. " +
+			"Usare quando lo stato cambia: ospiti arrivano/partono, pulizia inizia/finisce, stanza messa fuori servizio, ecc.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"room_id": {
+					"type": "integer",
+					"description": "ID della stanza"
+				},
+				"status": {
+					"type": "string",
+					"enum": ["available", "occupied", "stayover_due", "checkout_due", "cleaning", "ready", "out_of_service"],
+					"description": "Nuovo stato: available=libera, occupied=ospiti presenti, stayover_due=riassetto da fare, checkout_due=pulizia completa da fare, cleaning=in pulizia, ready=pronta, out_of_service=fuori servizio"
+				},
+				"guest_name": {
+					"type": "string",
+					"description": "Nome ospite (opzionale, rilevante per occupied/checkout_due)"
+				},
+				"checkin_at": {
+					"type": "string",
+					"description": "Data/ora check-in ospiti, ISO 8601 (opzionale)"
+				},
+				"checkout_at": {
+					"type": "string",
+					"description": "Data/ora checkout ospiti, ISO 8601 (opzionale)"
+				}
+			},
+			"required": ["room_id", "status"]
+		}`),
+	}
+}
+
+func (t *setRoomStatusTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	var in struct {
+		RoomID    int64   `json:"room_id"`
+		Status    string  `json:"status"`
+		GuestName *string `json:"guest_name"`
+		CheckinAt *string `json:"checkin_at"`
+		CheckoutAt *string `json:"checkout_at"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+
+	validStatuses := map[string]bool{
+		"available": true, "occupied": true, "stayover_due": true,
+		"checkout_due": true, "cleaning": true, "ready": true, "out_of_service": true,
+	}
+	if !validStatuses[in.Status] {
+		return "", fmt.Errorf("invalid status: %s", in.Status)
+	}
+
+	q := `UPDATE rooms SET status = $1, guest_name = COALESCE($2, guest_name)`
+	qArgs := []any{in.Status, in.GuestName}
+
+	if in.CheckinAt != nil {
+		ts, err := time.Parse(time.RFC3339, *in.CheckinAt)
+		if err != nil {
+			return "", fmt.Errorf("invalid checkin_at: %w", err)
+		}
+		q += fmt.Sprintf(", checkin_at = '%s'", ts.UTC().Format(time.RFC3339))
+	}
+	if in.CheckoutAt != nil {
+		ts, err := time.Parse(time.RFC3339, *in.CheckoutAt)
+		if err != nil {
+			return "", fmt.Errorf("invalid checkout_at: %w", err)
+		}
+		q += fmt.Sprintf(", checkout_at = '%s'", ts.UTC().Format(time.RFC3339))
+	}
+
+	q += " WHERE id = $3"
+	qArgs = append(qArgs, in.RoomID)
+
+	tag, err := db.Exec(context.Background(), q, qArgs...)
+	if err != nil {
+		return "", fmt.Errorf("update room: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return "", fmt.Errorf("room %d not found", in.RoomID)
+	}
+
+	statusLabel := map[string]string{
+		"available": "libera ✅", "occupied": "occupata 🛏️",
+		"stayover_due": "riassetto da fare 🧹", "checkout_due": "pulizia completa da fare 🧹",
+		"cleaning": "in pulizia 🫧", "ready": "pronta ✨", "out_of_service": "fuori servizio 🔧",
+	}
+	return fmt.Sprintf("✅ Stanza %d → %s", in.RoomID, statusLabel[in.Status]), nil
+}
+
+// ── add_reservation ──────────────────────────────────────────────────────────
+
+type addReservationTool struct {
+	adminPool *pgxpool.Pool
+}
+
+func (t *addReservationTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name: "add_reservation",
+		Description: "Inserisce una nuova prenotazione per una stanza e aggiorna automaticamente lo stato della stanza. " +
+			"Dopo l'inserimento, proponi all'utente di impostare reminder (es. 45 min prima del checkout per avvisare i cleaners).",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"room_id": {
+					"type": "integer",
+					"description": "ID della stanza"
+				},
+				"guest_name": {
+					"type": "string",
+					"description": "Nome dell'ospite"
+				},
+				"checkin_at": {
+					"type": "string",
+					"description": "Data/ora check-in, ISO 8601 con timezone"
+				},
+				"checkout_at": {
+					"type": "string",
+					"description": "Data/ora checkout, ISO 8601 con timezone"
+				},
+				"notes": {
+					"type": "string",
+					"description": "Note aggiuntive sulla prenotazione"
+				}
+			},
+			"required": ["room_id", "checkin_at", "checkout_at"]
+		}`),
+	}
+}
+
+func (t *addReservationTool) Execute(ctx agent.ToolContext, args json.RawMessage) (string, error) {
+	var in struct {
+		RoomID    int64   `json:"room_id"`
+		GuestName *string `json:"guest_name"`
+		CheckinAt string  `json:"checkin_at"`
+		CheckoutAt string `json:"checkout_at"`
+		Notes     *string `json:"notes"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", err
+	}
+
+	checkin, err := time.Parse(time.RFC3339, in.CheckinAt)
+	if err != nil {
+		return "", fmt.Errorf("invalid checkin_at: %w", err)
+	}
+	checkout, err := time.Parse(time.RFC3339, in.CheckoutAt)
+	if err != nil {
+		return "", fmt.Errorf("invalid checkout_at: %w", err)
+	}
+	if !checkout.After(checkin) {
+		return "", fmt.Errorf("checkout_at must be after checkin_at")
+	}
+
+	bg := context.Background()
+
+	// Insert reservation
+	var resID int64
+	err = t.adminPool.QueryRow(bg,
+		`INSERT INTO reservations (room_id, guest_name, checkin_at, checkout_at, notes, created_by)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		in.RoomID, in.GuestName, checkin, checkout, in.Notes, ctx.UserID,
+	).Scan(&resID)
+	if err != nil {
+		return "", fmt.Errorf("insert reservation: %w", err)
+	}
+
+	// Update room status and guest info
+	_, err = t.adminPool.Exec(bg,
+		`UPDATE rooms SET
+			guest_name  = $1,
+			checkin_at  = $2,
+			checkout_at = $3,
+			status      = CASE
+				WHEN now() >= $2 AND now() < $3 THEN 'occupied'
+				ELSE 'available'
+			END
+		 WHERE id = $4`,
+		in.GuestName, checkin, checkout, in.RoomID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("update room: %w", err)
+	}
+
+	guestStr := ""
+	if in.GuestName != nil {
+		guestStr = " per " + *in.GuestName
+	}
+	nights := int(checkout.Sub(checkin).Hours() / 24)
+	nightStr := "notte"
+	if nights != 1 {
+		nightStr = "notti"
+	}
+
+	return fmt.Sprintf(
+		"✅ Prenotazione #%d aggiunta: stanza %d%s\n📅 Check-in: %s\n📅 Checkout: %s\n🌙 %d %s\n\n"+
+			"💡 Vuoi che programmi un reminder per i cleaners? (es. 45 min prima del checkout)",
+		resID, in.RoomID, guestStr,
+		checkin.Format("02/01/2006 15:04"),
+		checkout.Format("02/01/2006 15:04"),
+		nights, nightStr,
+	), nil
 }
