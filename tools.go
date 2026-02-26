@@ -118,12 +118,20 @@ func (t *readSchemaTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (stri
 	if err != nil {
 		return "", err
 	}
+	return dumpSchema(context.Background(), db)
+}
 
-	// Columns per table
-	colRows, err := db.Query(context.Background(), `
+// dumpSchema queries information_schema and returns a compact human-readable
+// schema dump (tables, columns, types, FKs). Used both by readSchemaTool and
+// injected directly into the system prompt at session start.
+func dumpSchema(ctx context.Context, db *pgxpool.Pool) (string, error) {
+	// Columns per table — exclude internal tables and implementation-detail columns
+	colRows, err := db.Query(ctx, `
 		SELECT table_name, column_name, data_type, column_default, is_nullable
 		FROM information_schema.columns
 		WHERE table_schema = 'public'
+		  AND table_name NOT IN ('user_credentials')
+		  AND NOT (table_name = 'users' AND column_name IN ('pg_user', 'is_admin'))
 		ORDER BY table_name, ordinal_position
 	`)
 	if err != nil {
@@ -156,7 +164,7 @@ func (t *readSchemaTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (stri
 	}
 
 	// Foreign keys
-	fkRows, err := db.Query(context.Background(), `
+	fkRows, err := db.Query(ctx, `
 		SELECT
 			kcu.table_name, kcu.column_name,
 			ccu.table_name AS ref_table, ccu.column_name AS ref_column
@@ -166,6 +174,7 @@ func (t *readSchemaTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (stri
 		JOIN information_schema.constraint_column_usage ccu
 			ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
 		WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+		  AND kcu.table_name NOT IN ('user_credentials')
 		ORDER BY kcu.table_name, kcu.column_name
 	`)
 	if err != nil {

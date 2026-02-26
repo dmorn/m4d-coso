@@ -135,7 +135,12 @@ func main() {
 			if language == "" {
 				language = "Italian"
 			}
-			return buildPrompt(hotelName, userID, role, name, language)
+			schema, err := dumpSchema(ctx, adminPool)
+			if err != nil {
+				log.Printf("warn: dumpSchema: %v", err)
+				schema = "(schema unavailable)"
+			}
+			return buildPrompt(hotelName, userID, role, name, language, schema)
 		},
 	})
 
