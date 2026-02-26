@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -30,7 +31,8 @@ func main() {
 	dbURL := envOr("DATABASE_URL", "postgresql://postgres:devpassword@localhost:5432/m4dtimes")
 	hotelName := envOr("HOTEL_NAME", "Hotel Cimon")
 	llmModel := envOr("LLM_MODEL", "claude-3-5-sonnet-20241022")
-	adminTelegramID := int64(7756297856) // Dani
+	adminTelegramID := mustEnvInt64("ADMIN_TELEGRAM_ID")
+	adminName := envOr("ADMIN_NAME", "Admin")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -52,7 +54,7 @@ func main() {
 	// Bootstrap admin/manager on first run
 	if !registry.IsRegistered(ctx, adminTelegramID) {
 		log.Printf("bootstrapping manager %d...", adminTelegramID)
-		if err := registry.Register(ctx, adminTelegramID, RoleManager, "Dani"); err != nil {
+		if err := registry.Register(ctx, adminTelegramID, RoleManager, adminName); err != nil {
 			log.Fatalf("register manager: %v", err)
 		}
 	}
@@ -165,4 +167,13 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func mustEnvInt64(key string) int64 {
+	v := mustEnv(key)
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.Fatalf("env %s: invalid int64: %v", key, err)
+	}
+	return n
 }
