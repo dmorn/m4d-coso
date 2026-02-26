@@ -14,6 +14,7 @@ CREATE TABLE "users" (
   "created_at" timestamptz NOT NULL DEFAULT now(),
   "name" text NULL,
   "role" text NOT NULL DEFAULT 'cleaner',
+  "language" text NOT NULL DEFAULT 'Italian',
   "is_admin" boolean NULL GENERATED ALWAYS AS (role = 'manager'::text) STORED,
   PRIMARY KEY ("telegram_id"),
   CONSTRAINT "users_pg_user_key" UNIQUE ("pg_user")

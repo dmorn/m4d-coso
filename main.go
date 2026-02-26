@@ -124,18 +124,18 @@ func main() {
 		},
 
 		BuildPrompt: func(userID, _ int64) string {
-			var pgUser, name, roleStr string
+			var name, roleStr, language string
 			adminPool.QueryRow(ctx,
-				`SELECT pg_user, COALESCE(name,''), role FROM users WHERE telegram_id = $1`, userID,
-			).Scan(&pgUser, &name, &roleStr)
-			if pgUser == "" {
-				pgUser = fmt.Sprintf("tg_%d", userID)
-			}
+				`SELECT COALESCE(name,''), role, language FROM users WHERE telegram_id = $1`, userID,
+			).Scan(&name, &roleStr, &language)
 			role := Role(roleStr)
 			if role == "" {
 				role = RoleCleaner
 			}
-			return buildPrompt(hotelName, userID, pgUser, role, name)
+			if language == "" {
+				language = "Italian"
+			}
+			return buildPrompt(hotelName, userID, role, name, language)
 		},
 	})
 
