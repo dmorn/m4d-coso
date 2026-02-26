@@ -59,6 +59,11 @@ func main() {
 		}
 	}
 
+	// Seed default prompt templates if the prompts table is empty
+	if err := seedPrompts(ctx, adminPool); err != nil {
+		log.Printf("warn: seedPrompts: %v", err)
+	}
+
 	provider, err := llm.NewAnthropicProvider(nil)
 	if err != nil {
 		log.Fatalf("llm provider: %v", err)
@@ -137,12 +142,27 @@ func main() {
 			if language == "" {
 				language = "Italian"
 			}
+			if name == "" {
+				name = fmt.Sprintf("user %d", userID)
+			}
+
+			// Load prompt template from DB; fall back to embedded default
+			var tmpl string
+			adminPool.QueryRow(ctx,
+				`SELECT template FROM prompts WHERE role = $1`, string(role),
+			).Scan(&tmpl)
+			if tmpl == "" {
+				tmpl = defaultTemplate(role)
+			}
+
 			schema, err := dumpSchema(ctx, adminPool)
 			if err != nil {
 				log.Printf("warn: dumpSchema: %v", err)
 				schema = "(schema unavailable)"
 			}
-			return buildPrompt(hotelName, userID, role, name, language, schema)
+
+			pCtx := newPromptContext(hotelName, userID, role, name, language, schema)
+			return renderPrompt(tmpl, pCtx)
 		},
 	})
 

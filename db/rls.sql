@@ -48,6 +48,15 @@ BEGIN
     END LOOP;
 END $$;
 
+-- ── RLS: prompts ─────────────────────────────────────────────────────────────
+-- Prompts are system config — managers can CRUD, cleaners cannot touch them.
+-- The bot reads them via adminPool (superuser, bypasses RLS).
+ALTER TABLE prompts ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS prompts_select ON prompts;
+DROP POLICY IF EXISTS prompts_all    ON prompts;
+CREATE POLICY prompts_select ON prompts FOR SELECT USING (is_manager());
+CREATE POLICY prompts_all    ON prompts FOR ALL    USING (is_manager()) WITH CHECK (is_manager());
+
 -- ── RLS: user_credentials ─────────────────────────────────────────────────────
 -- Defense-in-depth: no non-superuser can ever read credentials.
 -- The admin pool (postgres/superuser) bypasses RLS automatically.

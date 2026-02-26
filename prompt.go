@@ -1,34 +1,99 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"strings"
+	"text/template"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// buildPrompt returns the system prompt tailored to the user's role and language.
-func buildPrompt(hotelName string, telegramID int64, role Role, name, language, schema string) string {
-	if name == "" {
-		name = fmt.Sprintf("user %d", telegramID)
+// PromptContext holds all the values available inside a prompt template.
+// Template syntax: {{.HotelName}}, {{.Name}}, {{.TelegramID}}, etc.
+type PromptContext struct {
+	HotelName   string
+	Name        string
+	TelegramID  int64
+	Role        string
+	Language    string
+	CurrentTime string
+	Schema      string
+}
+
+// renderPrompt executes a Go text/template against ctx.
+// On parse or execution error, returns the raw template string as fallback.
+func renderPrompt(tmpl string, ctx PromptContext) string {
+	t, err := template.New("prompt").Parse(tmpl)
+	if err != nil {
+		return tmpl // fallback: return raw template
 	}
+	var buf strings.Builder
+	if err := t.Execute(&buf, ctx); err != nil {
+		return tmpl
+	}
+	return buf.String()
+}
+
+// newPromptContext builds a PromptContext for the given user.
+func newPromptContext(hotelName string, telegramID int64, role Role, name, language, schema string) PromptContext {
 	loc, err := time.LoadLocation("Europe/Rome")
 	if err != nil {
 		loc = time.UTC
 	}
-	currentTime := time.Now().In(loc).Format("Monday, January 2, 2006 — 15:04 (Europe/Rome)")
-
-	switch role {
-	case RoleManager:
-		return managerPrompt(hotelName, name, telegramID, language, currentTime, schema)
-	default:
-		return cleanerPrompt(hotelName, name, telegramID, language, currentTime, schema)
+	return PromptContext{
+		HotelName:   hotelName,
+		Name:        name,
+		TelegramID:  telegramID,
+		Role:        string(role),
+		Language:    language,
+		CurrentTime: time.Now().In(loc).Format("Monday, January 2, 2006 — 15:04 (Europe/Rome)"),
+		Schema:      schema,
 	}
 }
 
-func managerPrompt(hotelName, name string, telegramID int64, language, currentTime, schema string) string {
-	return fmt.Sprintf(`You are the hotel management assistant for %s.
-You are speaking with %s (manager, Telegram ID: %d).
-Current date and time: %s
-Language: always respond in **%s**. Match the user's language if they switch.
+// ── Default templates ─────────────────────────────────────────────────────────
+// Used on first boot to seed the prompts table.
+// Template variables: {{.HotelName}} {{.Name}} {{.TelegramID}} {{.CurrentTime}}
+//                     {{.Language}} {{.Schema}} {{.Role}}
+
+// defaultTemplate returns the embedded default template for a role.
+func defaultTemplate(role Role) string {
+	switch role {
+	case RoleManager:
+		return DefaultManagerTemplate
+	default:
+		return DefaultCleanerTemplate
+	}
+}
+
+// seedPrompts inserts the default templates into the prompts table if they
+// don't exist yet. Safe to call on every boot (INSERT ... ON CONFLICT DO NOTHING).
+func seedPrompts(ctx context.Context, pool *pgxpool.Pool) error {
+	seeds := []struct {
+		role     string
+		template string
+	}{
+		{string(RoleManager), DefaultManagerTemplate},
+		{string(RoleCleaner), DefaultCleanerTemplate},
+	}
+	for _, s := range seeds {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO prompts (role, template) VALUES ($1, $2)
+			 ON CONFLICT (role) DO NOTHING`,
+			s.role, s.template,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const DefaultManagerTemplate = `You are the hotel management assistant for {{.HotelName}}.
+You are speaking with {{.Name}} (manager, Telegram ID: {{.TelegramID}}).
+Current date and time: {{.CurrentTime}}
+Language: always respond in **{{.Language}}**. Match the user's language if they switch.
 
 ## What you can do
 Manage the hotel through the database: rooms, reservations, cleaning assignments,
@@ -65,18 +130,16 @@ a reminder. The user can always say no.
 - Always propose reminders when timing is mentioned
 
 ## Database schema
-%s`, hotelName, name, telegramID, currentTime, language, schema)
-}
+{{.Schema}}`
 
-func cleanerPrompt(hotelName, name string, telegramID int64, language, currentTime, schema string) string {
-	return fmt.Sprintf(`You are the cleaning assistant for %s.
-You are speaking with %s (cleaning staff, Telegram ID: %d).
-Current date and time: %s
-Language: always respond in **%s**. Match the user's language if they switch.
+const DefaultCleanerTemplate = `You are the cleaning assistant for {{.HotelName}}.
+You are speaking with {{.Name}} (cleaning staff, Telegram ID: {{.TelegramID}}).
+Current date and time: {{.CurrentTime}}
+Language: always respond in **{{.Language}}**. Match the user's language if they switch.
 
 ## What you can do
 - See which rooms need cleaning today (status: checkout_due, stayover_due, cleaning)
-- Self-assign to a room ("I'll take it") — insert a row in assignments with your own cleaner_id
+- Self-assign to a room ("I'll take it") — insert a row in assignments with cleaner_id = {{.TelegramID}}
 - View and update your own tasks: pending → in_progress → done (or skipped)
 - Add notes to your assignments (damage, missing items, issues)
 - Withdraw from a task (only while still pending — DELETE your own assignment)
@@ -93,7 +156,7 @@ Language: always respond in **%s**. Match the user's language if they switch.
   checkout = guests left: full clean, linen change, full sanitize
 
 ## Tools
-- **execute_sql** — run SQL. Always filter by cleaner_id = %d when writing to assignments.
+- **execute_sql** — run SQL. Always filter by cleaner_id = {{.TelegramID}} when writing to assignments.
 - **read_schema** — re-read the live schema if you need to debug a failed query.
 - **schedule_reminder** — create a timed Telegram reminder for yourself.
 - **send_user_message** — send a DM to a colleague or the manager.
@@ -113,5 +176,4 @@ Only do this if such a message is actually present — do not invent it.
 - Suggest reminders proactively
 
 ## Database schema
-%s`, hotelName, name, telegramID, currentTime, language, telegramID, schema)
-}
+{{.Schema}}`

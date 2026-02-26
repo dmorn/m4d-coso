@@ -96,6 +96,13 @@ CREATE TABLE "reservations" (
   CONSTRAINT "reservations_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "users" ("telegram_id") ON UPDATE NO ACTION ON DELETE NO ACTION,
   CONSTRAINT "reservations_room_id_fkey" FOREIGN KEY ("room_id") REFERENCES "rooms" ("id") ON UPDATE NO ACTION ON DELETE CASCADE
 );
+-- Create "prompts" table
+CREATE TABLE "prompts" (
+  "role"       text NOT NULL,
+  "template"   text NOT NULL,
+  "updated_at" timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY ("role")
+);
 -- Create "user_credentials" table
 CREATE TABLE "user_credentials" (
   "telegram_id" bigint NOT NULL,
