@@ -27,6 +27,7 @@ func newHotelTools(registry *UserRegistry, botName, botToken string, adminPool *
 func (h *HotelTools) Tools() []agent.Tool {
 	return []agent.Tool{
 		&executeSQLTool{},
+		&readSchemaTool{},
 		&generateInviteTool{registry: h.registry, botName: h.botName},
 		&sendUserMessageTool{adminPool: h.adminPool, botToken: h.botToken},
 		&scheduleReminderTool{adminPool: h.adminPool},
@@ -97,6 +98,114 @@ func (t *generateInviteTool) Execute(ctx agent.ToolContext, args json.RawMessage
 		"✅ Invito creato per %s (%s):\n%s\n\n⚠️ Il link scade tra 7 giorni ed è monouso.",
 		in.Name, in.Role, link,
 	), nil
+}
+
+// ── read_schema ───────────────────────────────────────────────────────────────
+
+type readSchemaTool struct{}
+
+func (t *readSchemaTool) Def() llm.ToolDef {
+	return llm.ToolDef{
+		Name: "read_schema",
+		Description: "Inspect the live database schema: tables, columns, types, and foreign keys. " +
+			"Use this when you need to discover what the database contains, or to debug a failed SQL query.",
+		Parameters: json.RawMessage(`{"type": "object", "properties": {}}`),
+	}
+}
+
+func (t *readSchemaTool) Execute(ctx agent.ToolContext, _ json.RawMessage) (string, error) {
+	db, err := poolFrom(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Columns per table
+	colRows, err := db.Query(context.Background(), `
+		SELECT table_name, column_name, data_type, column_default, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		ORDER BY table_name, ordinal_position
+	`)
+	if err != nil {
+		return "", fmt.Errorf("schema query: %w", err)
+	}
+	defer colRows.Close()
+
+	type colInfo struct {
+		name, dataType, defaultVal, nullable string
+	}
+	tables := make(map[string][]colInfo)
+	var tableOrder []string
+	seen := make(map[string]bool)
+
+	for colRows.Next() {
+		var tbl, col, dtype, nullable string
+		var def *string
+		if err := colRows.Scan(&tbl, &col, &dtype, &def, &nullable); err != nil {
+			return "", err
+		}
+		defStr := ""
+		if def != nil {
+			defStr = *def
+		}
+		if !seen[tbl] {
+			tableOrder = append(tableOrder, tbl)
+			seen[tbl] = true
+		}
+		tables[tbl] = append(tables[tbl], colInfo{col, dtype, defStr, nullable})
+	}
+
+	// Foreign keys
+	fkRows, err := db.Query(context.Background(), `
+		SELECT
+			kcu.table_name, kcu.column_name,
+			ccu.table_name AS ref_table, ccu.column_name AS ref_column
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+			ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		JOIN information_schema.constraint_column_usage ccu
+			ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+		WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+		ORDER BY kcu.table_name, kcu.column_name
+	`)
+	if err != nil {
+		return "", fmt.Errorf("fk query: %w", err)
+	}
+	defer fkRows.Close()
+
+	type fkInfo struct{ col, refTable, refCol string }
+	fks := make(map[string][]fkInfo)
+	for fkRows.Next() {
+		var tbl, col, refTbl, refCol string
+		if err := fkRows.Scan(&tbl, &col, &refTbl, &refCol); err != nil {
+			return "", err
+		}
+		fks[tbl] = append(fks[tbl], fkInfo{col, refTbl, refCol})
+	}
+
+	// Format output
+	var sb strings.Builder
+	for _, tbl := range tableOrder {
+		sb.WriteString(fmt.Sprintf("## %s\n", tbl))
+		for _, c := range tables[tbl] {
+			null := ""
+			if c.nullable == "YES" {
+				null = " NULL"
+			}
+			def := ""
+			if c.defaultVal != "" {
+				def = fmt.Sprintf(" DEFAULT %s", c.defaultVal)
+			}
+			sb.WriteString(fmt.Sprintf("  %-20s %s%s%s\n", c.name, c.dataType, null, def))
+		}
+		if refs, ok := fks[tbl]; ok {
+			for _, fk := range refs {
+				sb.WriteString(fmt.Sprintf("  FK: %s → %s(%s)\n", fk.col, fk.refTable, fk.refCol))
+			}
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String(), nil
 }
 
 // ── execute_sql ──────────────────────────────────────────────────────────────

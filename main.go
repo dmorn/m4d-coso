@@ -47,10 +47,6 @@ func main() {
 	}
 	log.Printf("connected to postgres: %s", dbURL)
 
-	if err := ensureSchema(ctx, adminPool); err != nil {
-		log.Fatalf("schema: %v", err)
-	}
-
 	registry := newUserRegistry(adminPool, dbURL)
 
 	// Bootstrap admin/manager on first run

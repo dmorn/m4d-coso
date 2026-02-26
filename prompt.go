@@ -45,66 +45,14 @@ Assignment types:
   stayover  = riassetto leggero (towels, bed tidy, no linen change)
   checkout  = pulizia completa (everything, linen change, full sanitize)
 
-## Database schema
-
-**rooms**
-| column      | type        | description                                               |
-|-------------|-------------|-----------------------------------------------------------|
-| id          | serial      | primary key                                               |
-| name        | text        | room identifier (e.g. "101", "Suite A")                   |
-| floor       | integer     | floor number                                              |
-| notes       | text        | maintenance notes, special instructions                   |
-| status      | text        | available / occupied / stayover_due / checkout_due / cleaning / ready / out_of_service |
-| guest_name  | text        | current or incoming guest name                            |
-| checkin_at  | timestamptz | current/next check-in time                                |
-| checkout_at | timestamptz | current/next checkout time                                |
-
-**reservations**
-| column      | type        | description                        |
-|-------------|-------------|------------------------------------|
-| id          | bigserial   | primary key                        |
-| room_id     | integer     | references rooms(id)               |
-| guest_name  | text        | guest name                         |
-| checkin_at  | timestamptz | arrival date/time                  |
-| checkout_at | timestamptz | departure date/time                |
-| notes       | text        | special requests, VIP notes        |
-| created_by  | bigint      | manager who entered it             |
-| created_at  | timestamptz | when it was entered                |
-
-**assignments**
-| column     | type    | description                                              |
-|------------|---------|----------------------------------------------------------|
-| id         | serial  | primary key                                              |
-| room_id    | integer | references rooms(id)                                     |
-| cleaner_id | bigint  | references users(telegram_id)                            |
-| type       | text    | 'stayover' or 'checkout'                                 |
-| date       | date    | cleaning date                                            |
-| shift      | text    | 'morning', 'afternoon', or 'evening'                     |
-| status     | text    | 'pending' → 'in_progress' → 'done' (or 'skipped')       |
-| notes      | text    | cleaner's notes (damage, issues, etc.)                   |
-| updated_at | timestamptz | last update                                          |
-
-**reminders**
-| column     | type        | description                                          |
-|------------|-------------|------------------------------------------------------|
-| id         | bigserial   | primary key                                          |
-| fire_at    | timestamptz | when to send (must be in the future)                 |
-| chat_id    | bigint      | Telegram chat to send to                             |
-| message    | text        | reminder text                                        |
-| room_id    | integer     | optional room context                                |
-| created_by | bigint      | who created it                                       |
-| fired_at   | timestamptz | null = pending, set when sent                        |
-
-**users**
-| column      | type        | description                         |
-|-------------|-------------|-------------------------------------|
-| telegram_id | bigint      | Telegram user ID                    |
-| name        | text        | display name                        |
-| role        | text        | 'manager' or 'cleaner'              |
-| created_at  | timestamptz | registration date                   |
+## Database
+Use **read_schema** to discover the current tables and columns whenever you need to
+write a query you're unsure about, or to debug a failed execute_sql call.
+Do not call it proactively — only when you actually need it.
 
 ## Tools available
 - **execute_sql** — run any SQL (SELECT returns table, INSERT/UPDATE/DELETE returns count)
+- **read_schema** — inspect live DB schema (tables, columns, FKs); use for discovery or debugging
 - **schedule_reminder** — create a timed reminder for anyone
 - **send_user_message** — send a Telegram DM to one or more staff members
 - **generate_invite** — create a one-time invite link for a new staff member
@@ -195,37 +143,9 @@ e lo programmo subito.
 - Cancellare task già iniziati (in_progress/done)
 - Aggiungere o rimuovere stanze
 
-## Schema DB (quello che ti serve)
-
-**rooms**
-| colonna     | descrizione                                           |
-|-------------|-------------------------------------------------------|
-| id          | ID stanza (serve per auto-assegnarti)                 |
-| name        | numero/nome stanza                                    |
-| floor       | piano                                                 |
-| status      | stato attuale (vedi lifecycle sotto)                  |
-| guest_name  | nome ospite attuale                                   |
-| checkout_at | quando fanno checkout                                 |
-| notes       | istruzioni speciali del manager                       |
-
-**assignments** — i task di pulizia
-| colonna    | descrizione                                                    |
-|------------|----------------------------------------------------------------|
-| id         | ID del task                                                    |
-| room_id    | quale stanza pulire                                            |
-| cleaner_id | chi se ne occupa (telegram_id)                                 |
-| type       | stayover (riassetto) o checkout (pulizia completa)             |
-| date       | data                                                           |
-| shift      | morning / afternoon / evening                                  |
-| status     | pending → in_progress → done (o skipped)                       |
-| notes      | note della cameriera (danni, mancanze, ecc.)                   |
-
-**users**
-| colonna     | descrizione              |
-|-------------|--------------------------|
-| telegram_id | ID Telegram              |
-| name        | nome collega             |
-| role        | manager / cleaner        |
+## Database
+Usa **read_schema** per scoprire le colonne esatte quando devi scrivere una query,
+o per fare debugging se una query fallisce. Non chiamarlo in automatico — solo quando serve.
 
 ## Query tipiche
 
