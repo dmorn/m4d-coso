@@ -1,200 +1,182 @@
 # sdk/agent
 
-Agent loop, tool registry, and turn orchestration. The brain that connects LLM, tools, and messaging.
+Agent loop, tool registry, per-user context isolation, and session recording hooks.
 
-## Origin
+Ported from [pi-agent](https://github.com/badlogic/pi-mono/tree/main/packages/agent)
+(`@mariozechner/pi-agent-core`) patterns to Go.
 
-Port of [pi-agent](https://github.com/badlogic/pi-mono/tree/main/packages/agent) (`@mariozechner/pi-agent-core`) patterns to Go.
-
-**Reference files in pi-mono:**
-- `packages/agent/src/agent-loop.ts` — the turn cycle (core loop)
-- `packages/agent/src/agent.ts` — Agent class, tool management, context
-- `packages/agent/src/types.ts` — AgentTool, events, config
-- `packages/coding-agent/src/core/agent-session.ts` — real-world retry/compaction
-- `packages/coding-agent/src/core/system-prompt.ts` — prompt construction
-- `packages/coding-agent/src/core/tools/*.ts` — concrete tool implementations
-
-## Architecture
+## Files
 
 ```
 sdk/agent/
-├── agent.go        # Agent struct, Run() main loop
-├── registry.go     # Tool registration and execution
-├── context.go      # Conversation history management + hooks
-├── logger.go       # Structured event logging
-└── config.go       # LoadConfig() from env vars
+├── agent.go      # Agent struct, Options, Run() main loop, Inject(), contextFor()
+├── context.go    # ContextManager — conversation history, OnAppend hook
+├── types.go      # ToolContext, ContextInjector, Messenger, Tool, ToolSet, Update, …
+├── registry.go   # ToolRegistry — register tools/toolsets, execute by name
+└── logger.go     # Structured event logger (stdout JSON)
 ```
 
-### The turn cycle
-
-This is the heart. Ported from `agent-loop.ts`:
+## Turn cycle
 
 ```
-┌─ telegram.Poll() ──────────────────────────────────┐
-│                                                      │
-│  for each message:                                   │
-│    1. Identify user + role (DB lookup)               │
-│    2. Append user message to history                 │
-│    3. Transform context (apply hooks)                │
-│    4. llm.Chat(system, messages, tools)              │
-│         │                                            │
-│         ├─ Response.Type == "text"                   │
-│         │    → send to Telegram, done                │
-│         │                                            │
-│         └─ Response.Type == "tool_use"               │
-│              for each tool_call:                     │
-│                validate args (JSON Schema)           │
-│                execute handler                       │
-│                  ├─ success → ToolResult             │
-│                  └─ error → ToolResult(isError=true) │
-│              append all ToolResults to history        │
-│              → loop back to step 4                   │
-│                                                      │
-│    5. Persist telegram offset                        │
-│    6. Log everything                                 │
-└──────────────────────────────────────────────────────┘
+telegram.Poll()
+      │
+      ▼  for each Update:
+   HandleStart?  ──yes──► redeem invite / onboard, send reply, next update
+      │no
+      ▼
+   Authorize?    ──reject──► send rejection message (0 LLM tokens), next update
+      │allow
+      ▼
+   BuildExtra(userID)        → ToolContext.Extra (e.g. *pgxpool.Pool)
+   BuildTools(userID)        → []llm.ToolDef
+   BuildPrompt(userID)       → system prompt string
+   contextFor(userID)        → per-user ContextManager
+
+   userCtx.Append(userMessage)
+
+   loop:
+     llm.Chat(system, context.Prepare(), tools)
+       │
+       ├─ type == "text"
+       │    userCtx.Append(assistantMessage + usage)
+       │    Messenger.Send(chatID, text)
+       │    break
+       │
+       └─ type == "tool_use"
+            userCtx.Append(assistantToolUseMessage + usage)
+            for each tool call:
+              Registry.Execute(name, args, toolCtx)  → ToolResult
+            userCtx.Append(toolResultMessage)
+            continue
 ```
 
-**Key insight from pi-agent:** tool errors don't crash the agent. They become structured `ToolResult{IsError: true}` messages that the LLM receives and can reason about ("the schedule query failed because no date was provided, let me ask the user").
+**Key invariant:** tool errors don't crash the agent — they become
+`ToolResult{IsError: true}` messages the LLM sees and reasons about.
 
-### Tool registry
+## Per-user conversation contexts
+
+Each user gets an isolated `ContextManager`, created lazily on first message:
 
 ```go
-type ToolHandler func(ctx ToolContext, args json.RawMessage) (string, error)
+func (a *Agent) contextFor(userID int64) *ContextManager
+```
 
-type ToolContext struct {
-    UserID    int64
-    Role      string  // "manager" or "cleaner"
-    HotelID   string
-    Timestamp int64
-    DB        *store.DB
+This prevents cross-user contamination in multi-user bots. A cleaner's "Sì"
+reply is never visible in the manager's conversation history and vice versa.
+
+## ContextInjector
+
+Tools sometimes need to inject a message into *another* user's context (e.g.
+`send_user_message` injects the sent DM into the recipient's context, so their
+next LLM turn has awareness of the question they're being asked).
+
+The `ContextInjector` interface keeps the dependency direction clean:
+
+```go
+// Defined in types.go — the SDK knows nothing about the caller
+type ContextInjector interface {
+    Inject(userID int64, msg llm.Message)
 }
-
-type ToolRegistry struct { ... }
-
-func (r *ToolRegistry) Register(name, description string, schema json.RawMessage, handler ToolHandler)
-func (r *ToolRegistry) Execute(name string, args json.RawMessage, ctx ToolContext) (*llm.ToolResult, error)
-func (r *ToolRegistry) Definitions() []llm.ToolDef  // for passing to LLM
 ```
 
-**pi-agent pattern:** tools are registered at startup with `setTools([...])`. Each tool has a name, description, JSON Schema, and an execute function. The registry converts them to `llm.ToolDef` for the LLM and routes execution by name.
+The `Agent` implements it. It is passed into every `ToolContext` so tools can
+call `ctx.ContextInjector.Inject(recipientID, msg)` without knowing about `Agent`.
 
-**Access control:** the `ToolContext` carries the user's role. Tool handlers check it:
+## Session recording
+
+Pass a `*session.Store` as `Options.Session` to record every message append
+to a per-user JSONL file:
+
 ```go
-func handleUpdateSchedule(ctx ToolContext, args json.RawMessage) (string, error) {
-    if ctx.Role != "manager" {
-        return "", fmt.Errorf("only managers can update the schedule")
-    }
+store, _ := session.NewStore("./sessions")
+agent.New(agent.Options{
+    Session: store,
     // ...
+})
+```
+
+The hook is wired in `contextFor()`:
+
+```go
+c.OnAppend = func(msg llm.Message) {
+    a.opts.Session.Record(userID, msg)
 }
 ```
 
-### Context management
+Every `ContextManager.Append(msg)` fires `OnAppend` — user messages, assistant
+replies (with usage), tool calls, and tool results are all recorded without
+modifying the loop logic.
 
-Conversation history with hooks for transformation:
+See [`sdk/session`](../session/) for the file format.
+
+## Options reference
+
+```go
+type Options struct {
+    LLM         *llm.Client       // required
+    Messenger   Messenger         // required — Poll() + Send()
+    Registry    *ToolRegistry     // tool definitions + execution
+    Prompt      string            // static system prompt (overridden by BuildPrompt)
+    BuildExtra  BuildExtra        // func(userID, chatID) (any, error) — per-message extra context
+    BuildTools  BuildTools        // func(userID, chatID) []llm.ToolDef — per-message tool list
+    BuildPrompt BuildPrompt       // func(userID, chatID) string — per-message system prompt
+    Logger      *Logger           // structured stdout logger (optional)
+    Session     *session.Store    // JSONL session recording (optional)
+    PollTimeout int               // long-poll timeout in seconds (default: 30)
+
+    HandleStart func(ctx, userID, chatID int64, payload string) (string, error)
+    // Called on /start [payload] BEFORE Authorize. Return ("", nil) to fall through.
+    // Use for invite-link onboarding: unregistered users can complete registration
+    // without hitting the authorization wall and consuming LLM tokens.
+
+    Authorize func(ctx, userID, chatID int64) (string, error)
+    // Called for every message BEFORE any LLM call.
+    // Return a non-empty string to reject the user (0 tokens consumed).
+}
+```
+
+## ToolContext
+
+```go
+type ToolContext struct {
+    UserID          int64
+    ChatID          int64
+    Timestamp       int64
+    Extra           any              // set by BuildExtra — e.g. *pgxpool.Pool
+    ContextInjector ContextInjector  // always set by agent; inject into other users' contexts
+}
+```
+
+## Tool and ToolSet interfaces
+
+```go
+// Single tool
+type Tool interface {
+    Def() llm.ToolDef
+    Execute(ctx ToolContext, args json.RawMessage) (string, error)
+}
+
+// Group of tools sharing state
+type ToolSet interface {
+    Tools() []Tool
+}
+```
+
+Register with:
+```go
+registry.RegisterTool(myTool)
+registry.RegisterToolSet(myToolSet)
+```
+
+## ContextManager
 
 ```go
 type ContextManager struct {
-    Messages    []llm.Message
-    MaxMessages int  // simple truncation (keep last N)
-
-    // Hooks (future extensibility)
-    TransformContext func([]llm.Message) []llm.Message
-    ConvertToLLM     func([]llm.Message) []llm.Message
+    Messages         []llm.Message
+    MaxMessages      int                      // default 40 — truncates oldest on overflow
+    TransformContext func([]llm.Message) []llm.Message  // prune/compact before LLM call
+    ConvertToLLM     func([]llm.Message) []llm.Message  // filter before sending to provider
+    OnAppend         func(msg llm.Message)               // called on every Append — used for session recording
 }
 ```
-
-**From pi-agent:** the core agent doesn't own context-window policy. It exposes hooks:
-- `TransformContext` — called before each LLM call, can prune/compact/summarize
-- `ConvertToLLM` — filters out app-internal messages before sending to provider
-
-**MVP:** simple truncation (keep last 20 messages). Future: summarization-based compaction like `coding-agent` does.
-
-### Logger
-
-Structured logging for every significant action:
-
-```go
-type Logger struct { ... }
-
-func (l *Logger) Inbound(userID int64, text string)
-func (l *Logger) LLMCall(model string, tokensIn, tokensOut int, durationMs int64)
-func (l *Logger) ToolExec(tool string, durationMs int64, success bool)
-func (l *Logger) Outbound(chatID int64, text string)
-func (l *Logger) Error(context string, err error)
-```
-
-Output: stdout (for orchestrator) + `events` table in SQLite (for analysis during demo phase).
-
-### Config
-
-```go
-type Config struct {
-    TelegramToken string  // env: TELEGRAM_BOT_TOKEN
-    LLMKey        string  // env: LLM_API_KEY
-    LLMModel      string  // env: LLM_MODEL (default: claude-sonnet-4-5-20250514)
-    DBPath        string  // env: DB_PATH (default: /data/state.db)
-    HotelName     string  // env: HOTEL_NAME
-    Timezone      string  // env: TIMEZONE (default: Europe/Rome)
-    LogLevel      string  // env: LOG_LEVEL (default: info)
-    MaxTokens     int     // env: LLM_MAX_TOKENS (default: 1024)
-    PollTimeout   int     // env: POLL_TIMEOUT (default: 30)
-}
-
-func LoadConfig() (*Config, error)  // reads from env vars
-```
-
-## What we took from pi-agent
-
-| pi-agent feature | sdk/agent | Notes |
-|-----------------|-----------|-------|
-| Turn cycle (LLM → tools → continue) | ✅ Ported | Core loop identical |
-| Tool registry + execute | ✅ Ported | Same pattern, Go types |
-| Error → structured ToolResult | ✅ Ported | Key resilience pattern |
-| Context hooks (transform/convert) | ✅ Ported | As function fields |
-| System prompt (mutable) | ✅ Ported | Set at init, changeable |
-| Event logging | ✅ Ported | Simplified (no event bus) |
-
-## What we deferred (but can add later)
-
-| pi-agent feature | Status | When to add |
-|-----------------|--------|-------------|
-| Streaming turns with live events | 🔮 | Web dashboard / real-time UI |
-| Session tree (branching/forking) | 🔮 | Multi-turn exploration |
-| Extension system (plugins) | 🔮 | When agents need runtime extensibility |
-| Steering queue (inject mid-turn) | 🔮 | When we need external interrupts |
-| Compaction (summarize old context) | 🔮 | When conversations exceed context window |
-| Follow-up queue | 🔮 | When we need chained prompts |
-| Multi-modal tool results (images) | 🔮 | When tools return visual data |
-
-### Adding compaction (future)
-
-When conversations get long, implement a `TransformContext` hook:
-
-```go
-agent.Context.TransformContext = func(msgs []llm.Message) []llm.Message {
-    if len(msgs) > 50 {
-        // Summarize first 40 messages into one, keep last 10
-        summary := summarize(msgs[:40])
-        return append([]llm.Message{summary}, msgs[40:]...)
-    }
-    return msgs
-}
-// Reference: packages/coding-agent/src/core/agent-session.ts (compaction logic)
-```
-
-### Adding streaming (future)
-
-Change `llm.Provider.Chat()` to return a channel of events:
-
-```go
-type StreamEvent struct {
-    Type string  // "text_delta", "toolcall_delta", "done", "error"
-    Data string
-}
-// Reference: packages/ai/src/stream.ts (event model)
-```
-
-## Status
-
-🔴 **Not started** — architecture and interfaces defined. Next: implement after sdk/llm.

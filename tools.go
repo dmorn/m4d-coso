@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	htmlpkg "html"
 	"strings"
 	"time"
 
@@ -13,23 +15,34 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// generateUUID returns a random UUID v4 string (8-4-4-4-12 hex).
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	return fmt.Sprintf("%x-%x-%x-%x-%x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 type HotelTools struct {
 	registry  *UserRegistry
 	botName   string // e.g. "cimon_hotel_bot"
 	botToken  string // Telegram bot token for outbound messages
 	adminPool *pgxpool.Pool
+	bus       agent.EventBus
 }
 
-func newHotelTools(registry *UserRegistry, botName, botToken string, adminPool *pgxpool.Pool) *HotelTools {
-	return &HotelTools{registry: registry, botName: botName, botToken: botToken, adminPool: adminPool}
+func newHotelTools(registry *UserRegistry, botName, botToken string, adminPool *pgxpool.Pool, bus agent.EventBus) *HotelTools {
+	return &HotelTools{registry: registry, botName: botName, botToken: botToken, adminPool: adminPool, bus: bus}
 }
 
 func (h *HotelTools) Tools() []agent.Tool {
 	return []agent.Tool{
 		&executeSQLTool{},
 		&readSchemaTool{},
-		&generateInviteTool{registry: h.registry, botName: h.botName},
-		&sendUserMessageTool{adminPool: h.adminPool, botToken: h.botToken},
+		&generateInviteTool{registry: h.registry, botName: h.botName, botToken: h.botToken},
+		&sendUserMessageTool{adminPool: h.adminPool, botToken: h.botToken, bus: h.bus},
 		&scheduleReminderTool{adminPool: h.adminPool},
 	}
 }
@@ -47,6 +60,7 @@ func poolFrom(ctx agent.ToolContext) (*pgxpool.Pool, error) {
 type generateInviteTool struct {
 	registry *UserRegistry
 	botName  string
+	botToken string
 }
 
 func (t *generateInviteTool) Def() llm.ToolDef {
@@ -94,10 +108,25 @@ func (t *generateInviteTool) Execute(ctx agent.ToolContext, args json.RawMessage
 	}
 
 	link := fmt.Sprintf("https://t.me/%s?start=%s", t.botName, token)
-	return fmt.Sprintf(
-		"✅ Invito creato per %s (%s):\n%s\n\n⚠️ Il link scade tra 7 giorni ed è monouso.",
-		in.Name, in.Role, link,
-	), nil
+
+	// Build HTML directly — the URL lives inside an href attribute, so underscores
+	// are never interpreted as markdown italic markers by the SDK converter.
+	htmlMsg := fmt.Sprintf(
+		"🔗 <b>Invito per %s</b> (%s)\n\n<a href=\"%s\">%s</a>\n\n<i>Scade tra 7 giorni · monouso</i>",
+		htmlpkg.EscapeString(in.Name), in.Role, link, link,
+	)
+
+	// Send the link directly to the manager's chat — bypasses LLM text generation,
+	// so the URL is never accidentally modified by the model.
+	if ctx.ChatID != 0 {
+		tg := telegram.New(t.botToken)
+		if err := tg.SendHTML(context.Background(), ctx.ChatID, htmlMsg); err != nil {
+			// Don't fail the tool call — the LLM can still relay the link as fallback
+			return fmt.Sprintf("✅ Invito creato per %s (%s), ma l'invio diretto è fallito.\nLink: %s\n⚠️ Il link scade tra 7 giorni ed è monouso.", in.Name, in.Role, link), nil
+		}
+	}
+
+	return fmt.Sprintf("✅ Invito per %s (%s) inviato direttamente in chat. Non ripetere il link nella risposta — è già stato consegnato.", in.Name, in.Role), nil
 }
 
 // ── read_schema ───────────────────────────────────────────────────────────────
@@ -304,6 +333,7 @@ func (t *executeSQLTool) Execute(ctx agent.ToolContext, args json.RawMessage) (s
 type sendUserMessageTool struct {
 	adminPool *pgxpool.Pool
 	botToken  string
+	bus       agent.EventBus
 }
 
 func (t *sendUserMessageTool) Def() llm.ToolDef {
@@ -392,6 +422,12 @@ func (t *sendUserMessageTool) Execute(ctx agent.ToolContext, args json.RawMessag
 	var sentNames []string
 
 	for _, r := range recipients {
+		// Look up recipient role to decide whether to publish a relay event.
+		var recipientRole string
+		_ = t.adminPool.QueryRow(bg,
+			`SELECT role FROM users WHERE telegram_id = $1`, r.telegramID,
+		).Scan(&recipientRole)
+
 		// In Telegram, the chat_id for a DM equals the user's telegram_id
 		if err := tg.Send(bg, r.telegramID, in.Message); err != nil {
 			failed++
@@ -409,6 +445,29 @@ func (t *sendUserMessageTool) Execute(ctx agent.ToolContext, args json.RawMessag
 				ctx.ContextInjector.Inject(r.telegramID, llm.Message{
 					Role: "assistant",
 					Content: []llm.ContentBlock{{Type: "text", Text: in.Message}},
+				})
+			}
+
+			// If the recipient is a manager and we have an event bus, publish a
+			// relay event so the manager agent processes the message autonomously.
+			if recipientRole == "manager" && t.bus != nil {
+				senderName := "system"
+				if ctx.UserID != 0 {
+					var sName string
+					_ = t.adminPool.QueryRow(bg,
+						`SELECT COALESCE(name, '') FROM users WHERE telegram_id = $1`, ctx.UserID,
+					).Scan(&sName)
+					if sName != "" {
+						senderName = sName
+					}
+				}
+				t.bus.Publish(agent.AgentEvent{
+					Kind:     agent.EventRelay,
+					TargetID: r.telegramID,
+					ChatID:   r.telegramID,
+					Content:  in.Message,
+					Source:   senderName,
+					EventID:  generateUUID(),
 				})
 			}
 		}

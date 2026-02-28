@@ -64,6 +64,20 @@ func main() {
 		log.Printf("warn: seedPrompts: %v", err)
 	}
 
+	// Resolve manager's Telegram ID for heartbeat events.
+	var managerID int64
+	if err := adminPool.QueryRow(ctx,
+		`SELECT telegram_id FROM users WHERE role='manager' LIMIT 1`,
+	).Scan(&managerID); err != nil {
+		log.Printf("warn: could not resolve manager telegram_id: %v", err)
+	}
+
+	// Event bus — persistent (survives restarts via agent_events table).
+	bus := agent.NewPersistentBus(adminPool)
+	if err := bus.ReplayUnprocessed(ctx); err != nil {
+		log.Printf("warn: event replay: %v", err)
+	}
+
 	provider, err := llm.NewAnthropicProvider(nil)
 	if err != nil {
 		log.Fatalf("llm provider: %v", err)
@@ -78,14 +92,17 @@ func main() {
 	log.Printf("session store: writing to %s", sessionDir)
 
 	toolRegistry := agent.NewToolRegistry()
-	toolRegistry.RegisterToolSet(newHotelTools(registry, botName, botToken, adminPool))
+	toolRegistry.RegisterToolSet(newHotelTools(registry, botName, botToken, adminPool, bus))
+
+	llmClient := llm.New(provider, llm.Options{Model: llmModel})
 
 	a := agent.New(agent.Options{
-		LLM:       llm.New(provider, llm.Options{Model: llmModel}),
+		LLM:       llmClient,
 		Messenger: telegram.New(botToken),
 		Registry:  toolRegistry,
 		Logger:    agent.NewLogger("info"),
 		Session:   sessionStore,
+		EventBus:  bus,
 
 		// HandleStart — deep-link invite redemption via /start <token>.
 		// Runs BEFORE Authorize so unregistered users can onboard themselves.
@@ -166,7 +183,8 @@ func main() {
 		},
 	})
 
-	startReminderLoop(ctx, adminPool, botToken)
+	startReminderProducer(ctx, adminPool, bus)
+	startHeartbeatProducer(ctx, bus, managerID)
 
 	log.Printf("starting %s agent...", hotelName)
 	if err := a.Run(ctx); err != nil {

@@ -5,30 +5,29 @@ import (
 	"log"
 	"time"
 
-	"github.com/dmorn/m4dtimes/sdk/telegram"
+	"github.com/dmorn/m4dtimes/sdk/agent"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// startReminderLoop launches a background goroutine that polls the reminders
-// table every minute and fires any due reminders via Telegram.
-// It exits when ctx is cancelled.
-func startReminderLoop(ctx context.Context, pool *pgxpool.Pool, botToken string) {
-	tg := telegram.New(botToken)
+// startReminderProducer launches a background goroutine that polls the
+// reminders table every minute and publishes EventReminder events for any due
+// reminders. The agent loop picks them up and delivers them to the recipient.
+func startReminderProducer(ctx context.Context, pool *pgxpool.Pool, bus agent.EventBus) {
 	go func() {
-		log.Printf("reminder loop started")
+		log.Printf("reminder producer started")
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
 		// Fire once immediately on startup to catch anything missed while down.
-		fireReminders(ctx, pool, tg)
+		fireReminders(ctx, pool, bus)
 
 		for {
 			select {
 			case <-ctx.Done():
-				log.Printf("reminder loop stopped")
+				log.Printf("reminder producer stopped")
 				return
 			case <-ticker.C:
-				fireReminders(ctx, pool, tg)
+				fireReminders(ctx, pool, bus)
 			}
 		}
 	}()
@@ -40,7 +39,7 @@ type dueReminder struct {
 	message string
 }
 
-func fireReminders(ctx context.Context, pool *pgxpool.Pool, tg *telegram.Client) {
+func fireReminders(ctx context.Context, pool *pgxpool.Pool, bus agent.EventBus) {
 	rows, err := pool.Query(ctx,
 		`SELECT id, chat_id, message FROM reminders
 		 WHERE fire_at <= now() AND fired_at IS NULL
@@ -65,17 +64,22 @@ func fireReminders(ctx context.Context, pool *pgxpool.Pool, tg *telegram.Client)
 	rows.Close()
 
 	for _, r := range due {
-		if err := tg.Send(ctx, r.chatID, r.message); err != nil {
-			log.Printf("reminder send (id=%d chat=%d): %v", r.id, r.chatID, err)
-			// Don't mark as fired — retry next tick.
-			continue
-		}
+		bus.Publish(agent.AgentEvent{
+			Kind:     agent.EventReminder,
+			TargetID: r.chatID,
+			ChatID:   r.chatID,
+			Content:  r.message,
+			Source:   "reminder",
+			EventID:  generateUUID(),
+		})
+
+		// Mark as fired immediately — the bus guarantees delivery.
 		if _, err := pool.Exec(ctx,
 			`UPDATE reminders SET fired_at = now() WHERE id = $1`, r.id,
 		); err != nil {
 			log.Printf("reminder mark fired (id=%d): %v", r.id, err)
 		} else {
-			log.Printf("reminder fired: id=%d chat=%d", r.id, r.chatID)
+			log.Printf("reminder published: id=%d chat=%d", r.id, r.chatID)
 		}
 	}
 }

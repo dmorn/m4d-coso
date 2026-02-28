@@ -95,6 +95,19 @@ func splitAtNewlines(text string, maxRunes int) []string {
 	return chunks
 }
 
+// SendHTML sends a pre-formatted HTML string directly to Telegram without any
+// Markdown-to-HTML conversion. Use this when you construct the HTML yourself
+// and need the content to reach Telegram verbatim (e.g. URLs with underscores).
+func (c *Client) SendHTML(ctx context.Context, chatID int64, html string) error {
+	chunks := splitAtNewlines(html, maxChunkRunes)
+	for _, chunk := range chunks {
+		if err := c.sendChunk(ctx, chatID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SendTyping sends a "typing" chat action. Telegram shows the indicator for ~5s.
 // Implements agent.TypingNotifier.
 func (c *Client) SendTyping(ctx context.Context, chatID int64) error {

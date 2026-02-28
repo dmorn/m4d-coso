@@ -17,12 +17,14 @@ type ContextInjector interface {
 // ToolContext is passed to every tool handler.
 // Extra carries domain-specific data (e.g. DB handle, user role) — set by the concrete agent.
 // ContextInjector is always set by the agent; use it to inject messages into other users' contexts.
+// EventBus, when set, allows tools to publish events directly into the agent loop.
 type ToolContext struct {
 	UserID          int64
 	ChatID          int64
 	Timestamp       int64
-	Extra           any            // domain-specific: set via BuildExtra
+	Extra           any             // domain-specific: set via BuildExtra
 	ContextInjector ContextInjector // injects messages into any user's conversation history
+	EventBus        EventBus        // optional: publish events from within a tool
 }
 
 // ToolHandler is the signature for all tool implementations.

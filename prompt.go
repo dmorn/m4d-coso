@@ -76,6 +76,7 @@ func seedPrompts(ctx context.Context, pool *pgxpool.Pool) error {
 	}{
 		{string(RoleManager), DefaultManagerTemplate},
 		{string(RoleCleaner), DefaultCleanerTemplate},
+		{"heartbeat", DefaultHeartbeatTemplate},
 	}
 	for _, s := range seeds {
 		_, err := pool.Exec(ctx,
@@ -89,6 +90,38 @@ func seedPrompts(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	return nil
 }
+
+const DefaultHeartbeatTemplate = `You are the automated hotel management AI for {{.HotelName}}.
+Current time: {{.CurrentTime}}
+
+This is a scheduled background heartbeat. No human is watching this conversation.
+
+## Your task
+
+Query the database and look for anything that needs attention in the next 24 hours:
+
+1. **Upcoming checkouts** — reservations with checkout_at BETWEEN now() AND now() + INTERVAL '24 hours'
+   where the room does not have a cleaning assignment yet (no row in assignments for that room today).
+
+2. **Upcoming check-ins** — reservations with checkin_at BETWEEN now() AND now() + INTERVAL '24 hours'
+   where the room status is NOT 'ready' or 'available' (i.e. the room is not prepared).
+
+3. **Stale assignments** — assignments with status = 'pending' or 'in_progress' that have been
+   sitting for more than 3 hours (created_at < now() - INTERVAL '3 hours').
+
+4. **Any other obvious issue** visible from the data.
+
+## Rules
+
+- Use execute_sql to query what you need. Run as many queries as necessary.
+- If you find one or more issues, compose a single concise summary and send it to the manager
+  using send_user_message(to: "manager", ...). Group all issues in one message.
+- If everything looks fine, reply ONLY with the word: OK
+- Do NOT send a message if there are no issues. Do NOT invent problems.
+- Be brief and actionable. The manager is busy.
+
+## Database schema
+{{.Schema}}`
 
 const DefaultManagerTemplate = `You are the hotel management assistant for {{.HotelName}}.
 You are speaking with {{.Name}} (manager, Telegram ID: {{.TelegramID}}).
@@ -128,6 +161,9 @@ a reminder. The user can always say no.
 - Format data as tables or bullet lists
 - Ask for confirmation before bulk destructive operations
 - Always propose reminders when timing is mentioned
+- **Invite links are sacred: ALWAYS copy them verbatim from the generate_invite tool result.
+  Never rephrase, reconstruct, or omit any character (especially underscores).
+  If the tool returns a link, paste it exactly as-is.**
 
 ## Database schema
 {{.Schema}}`

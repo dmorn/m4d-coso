@@ -50,3 +50,29 @@ func (c *ContextManager) Prepare() []llm.Message {
 func (c *ContextManager) Reset() {
 	c.Messages = nil
 }
+
+// Snapshot returns up to n most recent messages, suitable for crash recovery.
+// If n <= 0 or n >= len(Messages), all messages are returned.
+func (c *ContextManager) Snapshot(n int) []llm.Message {
+	if n <= 0 || n >= len(c.Messages) {
+		out := make([]llm.Message, len(c.Messages))
+		copy(out, c.Messages)
+		return out
+	}
+	start := len(c.Messages) - n
+	out := make([]llm.Message, n)
+	copy(out, c.Messages[start:])
+	return out
+}
+
+// RestoreSnapshot prepends msgs to the existing context. Use after crash recovery
+// to seed the conversation history before replaying events.
+func (c *ContextManager) RestoreSnapshot(msgs []llm.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	restored := make([]llm.Message, len(msgs)+len(c.Messages))
+	copy(restored, msgs)
+	copy(restored[len(msgs):], c.Messages)
+	c.Messages = restored
+}
